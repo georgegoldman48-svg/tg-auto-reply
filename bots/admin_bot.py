@@ -104,22 +104,19 @@ async def cmd_start(message: Message):
         logger.warning(f"Unauthorized access attempt from user {message.from_user.id}")
         return
     
-    help_text = """
-🤖 *Admin Bot для Auto-Reply*
-
-*Управление:*
-/status — текущий статус системы
-/auto\\_on — включить автоответы
-/auto\\_off — выключить автоответы
-
-*Информация:*
-/rules — список правил автоответа
-/peers — список собеседников
-/stats — статистика
-
-*Версия:* 1.0.0
-"""
-    await message.answer(help_text, parse_mode="Markdown")
+    help_text = (
+        "🤖 Admin Bot для Auto-Reply\n\n"
+        "Управление:\n"
+        "/status — текущий статус системы\n"
+        "/auto_on — включить автоответы\n"
+        "/auto_off — выключить автоответы\n\n"
+        "Информация:\n"
+        "/rules — список правил автоответа\n"
+        "/peers — список собеседников\n"
+        "/stats — статистика\n\n"
+        "Версия: 1.0.0"
+    )
+    await message.answer(help_text)
     logger.info(f"Admin {message.from_user.id} started the bot")
 
 
@@ -158,16 +155,14 @@ async def cmd_status(message: Message):
         status_emoji = "🟢" if enabled else "🔴"
         status_text = "Включен" if enabled else "Выключен"
         
-        text = f"""
-📊 *Статус системы*
-
-{status_emoji} Автоответ: *{status_text}*
-
-📋 Всего правил: {rules_count}
-✅ Активных: {active_rules}
-👥 Собеседников: {peers_count}
-"""
-        await message.answer(text, parse_mode="Markdown")
+        text = (
+            f"📊 Статус системы\n\n"
+            f"{status_emoji} Автоответ: {status_text}\n\n"
+            f"📋 Всего правил: {rules_count}\n"
+            f"✅ Активных: {active_rules}\n"
+            f"👥 Собеседников: {peers_count}"
+        )
+        await message.answer(text)
         
     except Exception as e:
         logger.error(f"Error in /status: {e}")
@@ -189,7 +184,7 @@ async def cmd_auto_on(message: Message):
                 ON CONFLICT (key) DO UPDATE SET value = '1', updated_at = now()
             """)
         
-        await message.answer("🟢 Автоответы *включены*", parse_mode="Markdown")
+        await message.answer("🟢 Автоответы включены")
         logger.info(f"Auto-reply enabled by admin {message.from_user.id}")
         
     except Exception as e:
@@ -212,7 +207,7 @@ async def cmd_auto_off(message: Message):
                 ON CONFLICT (key) DO UPDATE SET value = '0', updated_at = now()
             """)
         
-        await message.answer("🔴 Автоответы *выключены*", parse_mode="Markdown")
+        await message.answer("🔴 Автоответы выключены")
         logger.info(f"Auto-reply disabled by admin {message.from_user.id}")
         
     except Exception as e:
@@ -250,7 +245,7 @@ async def cmd_rules(message: Message):
             await message.answer("📋 Нет настроенных правил автоответа")
             return
         
-        text = "📋 *Правила автоответа:*\n\n"
+        text = "📋 Правила автоответа:\n\n"
         for row in rows:
             status = "✅" if row['enabled'] else "❌"
             name = row['first_name'] or row['username'] or f"ID:{row['tg_peer_id']}"
@@ -258,11 +253,11 @@ async def cmd_rules(message: Message):
             if len(row['template'] or '') > 40:
                 template_preview += "..."
             
-            text += f"{status} *{name}* (peer\\_id: {row['peer_id']})\n"
+            text += f"{status} {name} (peer_id: {row['peer_id']})\n"
             text += f"   📝 {template_preview}\n"
             text += f"   ⏱ Интервал: {row['min_interval_sec']}с\n\n"
         
-        await message.answer(text, parse_mode="Markdown")
+        await message.answer(text)
         
     except Exception as e:
         logger.error(f"Error in /rules: {e}")
@@ -295,15 +290,15 @@ async def cmd_peers(message: Message):
             await message.answer("👥 Нет собеседников в базе")
             return
         
-        text = "👥 *Собеседники:*\n\n"
+        text = "👥 Собеседники:\n\n"
         for row in rows:
             name = row['first_name'] or row['username'] or "—"
             username = f"@{row['username']}" if row['username'] else "—"
             
-            text += f"• *{name}* ({username})\n"
-            text += f"  ID: `{row['id']}` | TG: `{row['tg_peer_id']}`\n\n"
+            text += f"• {name} ({username})\n"
+            text += f"  ID: {row['id']} | TG: {row['tg_peer_id']}\n\n"
         
-        await message.answer(text, parse_mode="Markdown")
+        await message.answer(text)
         
     except Exception as e:
         logger.error(f"Error in /peers: {e}")
@@ -348,19 +343,17 @@ async def cmd_stats(message: Message):
                 WHERE last_reply_time >= CURRENT_DATE
             """)
         
-        text = f"""
-📊 *Статистика*
-
-💬 *Сообщения:*
-   Всего: {total_messages:,}
-   Сегодня: {today_messages}
-   ├ Входящих: {incoming_today}
-   └ Исходящих: {outgoing_today}
-
-👥 Собеседников: {unique_peers}
-🤖 Автоответов сегодня: {auto_replies_today or 0}
-"""
-        await message.answer(text, parse_mode="Markdown")
+        text = (
+            f"📊 Статистика\n\n"
+            f"💬 Сообщения:\n"
+            f"   Всего: {total_messages}\n"
+            f"   Сегодня: {today_messages}\n"
+            f"   Входящих: {incoming_today}\n"
+            f"   Исходящих: {outgoing_today}\n\n"
+            f"👥 Собеседников: {unique_peers}\n"
+            f"🤖 Автоответов сегодня: {auto_replies_today or 0}"
+        )
+        await message.answer(text)
         
     except Exception as e:
         logger.error(f"Error in /stats: {e}")
