@@ -1,0 +1,20 @@
+[Unit]
+Description=TG Auto-Reply Core API
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=aiuser
+Group=aiuser
+WorkingDirectory=/home/aiuser/tg-auto-reply
+Environment=PATH=/home/aiuser/tg-auto-reply/venv/bin
+EnvironmentFile=/home/aiuser/tg-auto-reply/.env
+ExecStart=/home/aiuser/tg-auto-reply/venv/bin/uvicorn core.main:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
