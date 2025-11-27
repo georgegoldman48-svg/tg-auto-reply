@@ -1,7 +1,7 @@
 """
 Главное FastAPI приложение - TG Auto-Reply Core API
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, status
 from contextlib import asynccontextmanager
 import os
 import logging
@@ -85,11 +85,19 @@ async def get_setting(key: str):
                 key
             )
             if not row:
-                return {"key": key, "value": None, "exists": False}
-            return {"key": key, "value": row['value'], "updated_at": row['updated_at'], "exists": True}
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Setting '{key}' not found"
+                )
+            return {"key": key, "value": row['value'], "updated_at": row['updated_at']}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get setting {key}: {e}")
-        return {"key": key, "error": str(e)}
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
 
 
 @app.put("/settings/{key}")
@@ -106,7 +114,10 @@ async def set_setting(key: str, value: str):
             return {"key": key, "value": value, "status": "updated"}
     except Exception as e:
         logger.error(f"Failed to set setting {key}: {e}")
-        return {"key": key, "error": str(e)}
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
 
 
 @app.get("/stats")
@@ -126,6 +137,11 @@ async def get_stats():
             auto_reply_enabled = await conn.fetchval(
                 "SELECT value FROM settings WHERE key = 'auto_reply_enabled'"
             )
+            # Количество peers, которым отвечали сегодня
+            peers_replied_today = await conn.fetchval("""
+                SELECT COUNT(*) FROM auto_reply_state 
+                WHERE last_reply_time >= CURRENT_DATE
+            """)
             
             return {
                 "total_messages": total_messages or 0,
@@ -133,8 +149,12 @@ async def get_stats():
                 "total_rules": total_rules or 0,
                 "active_rules": active_rules or 0,
                 "today_messages": today_messages or 0,
+                "peers_replied_today": peers_replied_today or 0,
                 "auto_reply_enabled": auto_reply_enabled == '1'
             }
     except Exception as e:
         logger.error(f"Failed to get stats: {e}")
-        return {"error": str(e)}
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )

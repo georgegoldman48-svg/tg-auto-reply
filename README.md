@@ -25,7 +25,7 @@
 ### 1. Клонирование и установка
 
 ```bash
-git clone <repo-url> tg-auto-reply
+git clone https://github.com/georgegoldman48-svg/tg-auto-reply.git
 cd tg-auto-reply
 
 python3 -m venv venv
