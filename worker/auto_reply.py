@@ -1,8 +1,10 @@
 """
-Auto-Reply Worker
+Auto-Reply Worker с AI интеграцией
 
-Проверяет новые входящие сообщения и отправляет автоответы
-согласно настроенным правилам.
+Проверяет новые входящие сообщения и отправляет автоответы,
+сгенерированные через локальный AI сервер с учётом истории диалога.
+
+Если AI недоступен — отправляет fallback сообщение.
 
 Использование:
     python -m worker.auto_reply
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 import asyncpg
+import aiohttp
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
@@ -36,13 +39,25 @@ API_HASH = os.getenv('API_HASH')
 PHONE = os.getenv('PHONE_NUMBER')
 DATABASE_URL = os.getenv('DATABASE_URL')
 
+# AI сервер (через SSH туннель)
+AI_SERVER_URL = os.getenv('AI_SERVER_URL', 'http://localhost:8080')
+
+# Fallback сообщение если AI недоступен
+FALLBACK_MESSAGE = os.getenv('FALLBACK_MESSAGE', 'Сейчас занят')
+
+# Сколько сообщений из истории отправлять в AI
+HISTORY_LIMIT = int(os.getenv('HISTORY_LIMIT', '20'))
+
 # Интервал проверки (секунды)
 CHECK_INTERVAL = int(os.getenv('CHECK_INTERVAL', '5'))
+
+# Таймаут для AI запросов (секунды)
+AI_TIMEOUT = int(os.getenv('AI_TIMEOUT', '60'))
 
 # MVP: фиксированный account_id
 ACCOUNT_ID = 1
 
-# Путь к сессии (можно использовать ту же, что и collector, или отдельную)
+# Путь к сессии
 SESSION_DIR = Path(__file__).parent.parent / "sessions"
 SESSION_DIR.mkdir(exist_ok=True)
 SESSION_PATH = str(SESSION_DIR / "worker")
@@ -58,6 +73,7 @@ if not all([API_ID, API_HASH, PHONE, DATABASE_URL]):
 # Глобальные переменные
 db_pool: Optional[asyncpg.Pool] = None
 client: Optional[TelegramClient] = None
+http_session: Optional[aiohttp.ClientSession] = None
 
 
 async def init_db() -> asyncpg.Pool:
@@ -82,6 +98,24 @@ async def close_db() -> None:
         logger.info("Database pool closed")
 
 
+async def init_http() -> aiohttp.ClientSession:
+    """Инициализация HTTP сессии"""
+    global http_session
+    timeout = aiohttp.ClientTimeout(total=AI_TIMEOUT)
+    http_session = aiohttp.ClientSession(timeout=timeout)
+    logger.info("HTTP session initialized")
+    return http_session
+
+
+async def close_http() -> None:
+    """Закрытие HTTP сессии"""
+    global http_session
+    if http_session:
+        await http_session.close()
+        http_session = None
+        logger.info("HTTP session closed")
+
+
 async def is_auto_reply_enabled(conn: asyncpg.Connection) -> bool:
     """Проверить, включен ли автоответ глобально"""
     row = await conn.fetchrow(
@@ -90,16 +124,45 @@ async def is_auto_reply_enabled(conn: asyncpg.Connection) -> bool:
     return row is not None and row['value'] == '1'
 
 
+async def is_ai_enabled(conn: asyncpg.Connection) -> bool:
+    """Проверить, включен ли AI режим"""
+    row = await conn.fetchrow(
+        "SELECT value FROM settings WHERE key = 'ai_enabled'"
+    )
+    return row is not None and row['value'] == '1'
+
+
+async def get_conversation_history(conn: asyncpg.Connection, peer_id: int) -> List[Dict[str, Any]]:
+    """
+    Получить историю диалога с peer из БД.
+    
+    Возвращает последние HISTORY_LIMIT сообщений в хронологическом порядке.
+    """
+    rows = await conn.fetch("""
+        SELECT 
+            from_me,
+            text,
+            date
+        FROM messages
+        WHERE peer_id = $1 AND text IS NOT NULL AND text != ''
+        ORDER BY date DESC
+        LIMIT $2
+    """, peer_id, HISTORY_LIMIT)
+    
+    # Переворачиваем чтобы был хронологический порядок (старые → новые)
+    history = []
+    for row in reversed(rows):
+        history.append({
+            "role": "assistant" if row["from_me"] else "user",
+            "content": row["text"]
+        })
+    
+    return history
+
+
 async def get_candidates_for_reply(conn: asyncpg.Connection) -> List[Dict[str, Any]]:
     """
     Найти сообщения-кандидаты для автоответа.
-    
-    Критерии:
-    1. Сообщение входящее (from_me = false)
-    2. Сообщение недавнее (последние 5 минут)
-    3. Есть включенное правило для этого peer
-    4. Прошло достаточно времени с последнего автоответа (min_interval_sec)
-    5. Мы ещё не отвечали на это или более позднее сообщение
     """
     rows = await conn.fetch("""
         SELECT 
@@ -149,17 +212,46 @@ async def update_reply_state(conn: asyncpg.Connection, peer_id: int, message_id:
     """, ACCOUNT_ID, peer_id, message_id)
 
 
-async def send_reply(tg_peer_id: int, text: str) -> bool:
+async def generate_ai_response(prompt: str, peer_id: int, history: List[Dict[str, Any]]) -> Optional[str]:
     """
-    Отправить ответ через Telethon.
+    Получить ответ от AI сервера с учётом истории диалога.
     
     Args:
-        tg_peer_id: Telegram user_id получателя
-        text: Текст сообщения
-        
+        prompt: Текущее сообщение от пользователя
+        peer_id: ID собеседника (для кэширования на стороне AI сервера)
+        history: История диалога из БД
+    
     Returns:
-        bool: True если успешно отправлено
+        str: Ответ от AI или None если сервер недоступен
     """
+    try:
+        async with http_session.post(
+            f"{AI_SERVER_URL}/generate",
+            json={
+                "prompt": prompt,
+                "peer_id": peer_id,
+                "history": history
+            }
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("response")
+            else:
+                logger.warning(f"AI server returned status {resp.status}")
+                return None
+    except aiohttp.ClientConnectorError:
+        logger.warning("AI server unavailable (connection refused)")
+        return None
+    except asyncio.TimeoutError:
+        logger.warning(f"AI server timeout ({AI_TIMEOUT}s)")
+        return None
+    except Exception as e:
+        logger.error(f"AI request error: {e}")
+        return None
+
+
+async def send_reply(tg_peer_id: int, text: str) -> bool:
+    """Отправить ответ через Telethon."""
     try:
         await client.send_message(tg_peer_id, text)
         return True
@@ -171,9 +263,6 @@ async def send_reply(tg_peer_id: int, text: str) -> bool:
 async def process_auto_replies() -> int:
     """
     Основной цикл обработки автоответов.
-    
-    Returns:
-        int: Количество отправленных ответов
     """
     sent_count = 0
     
@@ -181,6 +270,9 @@ async def process_auto_replies() -> int:
         # Проверяем глобальный флаг
         if not await is_auto_reply_enabled(conn):
             return 0
+        
+        # Проверяем включен ли AI
+        ai_enabled = await is_ai_enabled(conn)
         
         # Получаем кандидатов для ответа
         candidates = await get_candidates_for_reply(conn)
@@ -192,21 +284,53 @@ async def process_auto_replies() -> int:
             peer_id = candidate['peer_id']
             tg_peer_id = candidate['tg_peer_id']
             template = candidate['template']
+            message_text = candidate['message_text'] or ""
             display_name = candidate['first_name'] or candidate['username'] or f"ID:{tg_peer_id}"
-            message_preview = (candidate['message_text'] or "[media]")[:30]
+            message_preview = message_text[:30] if message_text else "[media]"
             
             logger.info(f"Processing: {display_name} - \"{message_preview}...\"")
             
+            # Определяем текст ответа
+            if ai_enabled and message_text:
+                # Получаем историю диалога из БД
+                history = await get_conversation_history(conn, peer_id)
+                logger.info(f"Loaded {len(history)} messages from history")
+                
+                # Пробуем получить ответ от AI
+                reply_text = await generate_ai_response(message_text, peer_id, history)
+                
+                if reply_text:
+                    logger.info(f"AI response: {reply_text[:50]}...")
+                else:
+                    # AI недоступен — используем fallback
+                    reply_text = FALLBACK_MESSAGE
+                    logger.info(f"AI unavailable, using fallback: {reply_text}")
+            else:
+                # AI выключен — используем шаблон из правила
+                reply_text = template
+            
             # Отправляем ответ
-            if await send_reply(tg_peer_id, template):
-                # Обновляем состояние
+            if await send_reply(tg_peer_id, reply_text):
                 await update_reply_state(conn, peer_id, candidate['message_id'])
                 sent_count += 1
-                logger.info(f"✓ Auto-reply sent to {display_name}")
+                logger.info(f"✓ Reply sent to {display_name}")
             else:
-                logger.error(f"✗ Failed to send auto-reply to {display_name}")
+                logger.error(f"✗ Failed to send reply to {display_name}")
     
     return sent_count
+
+
+async def check_ai_server() -> bool:
+    """Проверить доступность AI сервера"""
+    try:
+        async with http_session.get(f"{AI_SERVER_URL}/health") as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                logger.info(f"AI server: {data.get('model', 'unknown')} on {data.get('gpu', 'unknown')}")
+                return True
+    except:
+        pass
+    return False
 
 
 async def main() -> None:
@@ -214,16 +338,28 @@ async def main() -> None:
     global client
     
     logger.info("=" * 60)
-    logger.info("Auto-Reply Worker v1.0")
+    logger.info("Auto-Reply Worker v2.0 (with AI + History)")
     logger.info("=" * 60)
     logger.info(f"Check interval: {CHECK_INTERVAL} seconds")
-    logger.info(f"Account ID: {ACCOUNT_ID}")
+    logger.info(f"AI server: {AI_SERVER_URL}")
+    logger.info(f"AI timeout: {AI_TIMEOUT} seconds")
+    logger.info(f"History limit: {HISTORY_LIMIT} messages")
+    logger.info(f"Fallback message: {FALLBACK_MESSAGE}")
     logger.info(f"Session path: {SESSION_PATH}")
     logger.info("=" * 60)
     
     # Инициализация БД
     await init_db()
     logger.info("Database connected")
+    
+    # Инициализация HTTP
+    await init_http()
+    
+    # Проверка AI сервера
+    if await check_ai_server():
+        logger.info("✓ AI server is available")
+    else:
+        logger.warning("✗ AI server is not available (will use fallback)")
     
     # Инициализация Telethon клиента
     client = TelegramClient(SESSION_PATH, int(API_ID), API_HASH)
@@ -260,6 +396,7 @@ async def main() -> None:
         logger.info("Received shutdown signal...")
     finally:
         await client.disconnect()
+        await close_http()
         await close_db()
         logger.info(f"Worker stopped. Total replies sent: {total_sent}")
 
