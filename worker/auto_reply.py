@@ -250,10 +250,10 @@ async def generate_ai_response(prompt: str, peer_id: int, history: List[Dict[str
         return None
 
 
-async def send_reply(tg_peer_id: int, text: str) -> bool:
+async def send_reply(tg_peer_id: int, text: str, reply_to_msg_id: int = None) -> bool:
     """Отправить ответ через Telethon."""
     try:
-        await client.send_message(tg_peer_id, text)
+        await client.send_message(tg_peer_id, text, reply_to=reply_to_msg_id)
         return True
     except Exception as e:
         logger.error(f"Failed to send message to {tg_peer_id}: {e}")
@@ -309,8 +309,9 @@ async def process_auto_replies() -> int:
                 # AI выключен — используем шаблон из правила
                 reply_text = template
             
-            # Отправляем ответ
-            if await send_reply(tg_peer_id, reply_text):
+            # Отправляем ответ (reply_to для привязки к сообщению)
+            tg_msg_id = candidate['tg_message_id']
+            if await send_reply(tg_peer_id, reply_text, reply_to_msg_id=tg_msg_id):
                 await update_reply_state(conn, peer_id, candidate['message_id'])
                 sent_count += 1
                 logger.info(f"✓ Reply sent to {display_name}")
