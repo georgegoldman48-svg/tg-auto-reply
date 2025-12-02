@@ -142,12 +142,15 @@ def generate_response(
     else:
         answer = response
 
-    # Убираем специальные токены
-    for token in SPECIAL_TOKENS:
-        answer = answer.replace(token, "")
+    # Обрезаем всё после первого <| (специальные токены)
+    if '<|' in answer:
+        answer = answer.split('<|')[0]
+
+    # Убираем </s> и другие токены
+    answer = answer.replace('</s>', '').replace('<s>', '')
 
     # Убираем возможные артефакты
-    answer = answer.strip()
+    answer = answer.rstrip('<').strip()
     if answer.startswith("\n"):
         answer = answer[1:]
 

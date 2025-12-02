@@ -182,19 +182,19 @@ async def get_candidates_for_reply(conn: asyncpg.Connection) -> List[Dict[str, A
         JOIN peers p ON p.id = m.peer_id
         JOIN auto_reply_rules r ON r.peer_id = m.peer_id AND r.account_id = $1
         LEFT JOIN auto_reply_state s ON s.peer_id = m.peer_id AND s.account_id = $1
-        WHERE 
+        WHERE
             m.from_me = false
             AND m.date > now() - interval '5 minutes'
             AND r.enabled = true
             AND (
-                s.last_reply_time IS NULL 
-                OR m.date > s.last_reply_time
+                s.last_message_id IS NULL
+                OR m.id > s.last_message_id
             )
             AND (
                 s.last_reply_time IS NULL
                 OR EXTRACT(EPOCH FROM (now() - s.last_reply_time)) >= r.min_interval_sec
             )
-        ORDER BY m.date ASC
+        ORDER BY m.id ASC
         LIMIT 10
     """, ACCOUNT_ID)
     
@@ -311,10 +311,11 @@ async def process_auto_replies() -> int:
             
             # Отправляем ответ (reply_to для привязки к сообщению)
             tg_msg_id = candidate['tg_message_id']
+            logger.info(f"Sending reply to tg_peer_id={tg_peer_id}, reply_to={tg_msg_id}")
             if await send_reply(tg_peer_id, reply_text, reply_to_msg_id=tg_msg_id):
                 await update_reply_state(conn, peer_id, candidate['message_id'])
                 sent_count += 1
-                logger.info(f"✓ Reply sent to {display_name}")
+                logger.info(f"✓ Reply sent to {display_name} (reply_to={tg_msg_id})")
             else:
                 logger.error(f"✗ Failed to send reply to {display_name}")
     
