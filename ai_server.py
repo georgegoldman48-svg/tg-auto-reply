@@ -36,7 +36,16 @@ HOST = "0.0.0.0"
 PORT = 8080
 LORA_PATH = "/home/george/sambalingo-egor"
 MAX_SEQ_LENGTH = 512
-SYSTEM_PROMPT = "Ты Егор. Отвечаешь коротко, живо, по делу. Без воды и официоза."
+DEFAULT_SYSTEM_PROMPT = "Ты Егор. Отвечаешь коротко, живо, по делу. Без воды и официоза."
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_MAX_TOKENS = 100
+
+# Глобальные настройки (можно менять через /settings)
+current_settings = {
+    "system_prompt": DEFAULT_SYSTEM_PROMPT,
+    "temperature": DEFAULT_TEMPERATURE,
+    "max_tokens": DEFAULT_MAX_TOKENS
+}
 
 # Fallback ответы для слишком коротких генераций
 FALLBACK_RESPONSES = ["ага", "ок", "понял", "да", "ну да", "угу"]
@@ -81,8 +90,10 @@ def load_model():
 def generate_response(
     prompt: str,
     history: Optional[List[Dict[str, Any]]] = None,
-    max_new_tokens: int = 100,
-    temperature: float = 0.7
+    max_new_tokens: Optional[int] = None,
+    temperature: Optional[float] = None,
+    system_prompt: Optional[str] = None,
+    peer_prompt: Optional[str] = None
 ) -> str:
     """
     Генерация ответа с учётом истории диалога.
@@ -90,12 +101,26 @@ def generate_response(
     Args:
         prompt: Текущее сообщение пользователя
         history: История диалога [{"role": "user/assistant", "content": "..."}]
-        max_new_tokens: Максимум токенов в ответе
-        temperature: Температура генерации
+        max_new_tokens: Максимум токенов в ответе (из глобальных настроек если None)
+        temperature: Температура генерации (из глобальных настроек если None)
+        system_prompt: System prompt (из глобальных настроек если None)
+        peer_prompt: Дополнительный промпт для конкретного пира из Telegram бота
 
     Returns:
         Сгенерированный ответ
     """
+    # Берём значения из глобальных настроек если не переданы
+    if max_new_tokens is None:
+        max_new_tokens = current_settings["max_tokens"]
+    if temperature is None:
+        temperature = current_settings["temperature"]
+    if system_prompt is None:
+        system_prompt = current_settings["system_prompt"]
+
+    # Комбинируем глобальный промпт + промпт для пира
+    if peer_prompt:
+        system_prompt = f"{system_prompt}\n\nДополнительно: {peer_prompt}"
+
     # Формируем контекст с историей
     messages = []
 
@@ -109,7 +134,7 @@ def generate_response(
     messages.append({"role": "user", "content": prompt})
 
     # Формируем промпт в ChatML формате
-    input_text = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n"
+    input_text = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
 
     for msg in messages:
         role = msg["role"]
@@ -189,30 +214,34 @@ class AIRequestHandler(BaseHTTPRequestHandler):
                 "gpu": gpu_name,
                 "ready": model is not None
             })
+        elif self.path == "/settings":
+            self.send_json_response(current_settings)
         else:
             self.send_json_response({"error": "Not found"}, 404)
 
     def do_POST(self):
         """Обработка POST запросов"""
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8")
+
         if self.path == "/generate":
             try:
-                # Читаем тело запроса
-                content_length = int(self.headers.get("Content-Length", 0))
-                body = self.rfile.read(content_length).decode("utf-8")
                 data = json.loads(body)
 
                 prompt = data.get("prompt", "")
                 history = data.get("history", [])
                 peer_id = data.get("peer_id", 0)
+                peer_prompt = data.get("peer_prompt")  # Промпт для пира из Telegram
 
                 if not prompt:
                     self.send_json_response({"error": "prompt is required"}, 400)
                     return
 
-                logger.info(f"[peer:{peer_id}] Q: {prompt[:50]}...")
+                log_extra = f"peer_prompt={peer_prompt[:20]}..." if peer_prompt else ""
+                logger.info(f"[peer:{peer_id}] Q: {prompt[:50]}... (temp={current_settings['temperature']}, max={current_settings['max_tokens']}) {log_extra}")
 
-                # Генерируем ответ
-                response = generate_response(prompt, history)
+                # Генерируем ответ с глобальными настройками + промпт для пира
+                response = generate_response(prompt, history, peer_prompt=peer_prompt)
 
                 logger.info(f"[peer:{peer_id}] A: {response[:50]}...")
 
@@ -222,6 +251,27 @@ class AIRequestHandler(BaseHTTPRequestHandler):
                 self.send_json_response({"error": "Invalid JSON"}, 400)
             except Exception as e:
                 logger.error(f"Generation error: {e}")
+                self.send_json_response({"error": str(e)}, 500)
+
+        elif self.path == "/settings":
+            try:
+                data = json.loads(body)
+
+                # Обновляем глобальные настройки
+                if "system_prompt" in data:
+                    current_settings["system_prompt"] = data["system_prompt"]
+                if "temperature" in data:
+                    current_settings["temperature"] = float(data["temperature"])
+                if "max_tokens" in data:
+                    current_settings["max_tokens"] = int(data["max_tokens"])
+
+                logger.info(f"Settings updated: temp={current_settings['temperature']}, max={current_settings['max_tokens']}, prompt={current_settings['system_prompt'][:30]}...")
+
+                self.send_json_response({"status": "ok", "settings": current_settings})
+
+            except json.JSONDecodeError:
+                self.send_json_response({"error": "Invalid JSON"}, 400)
+            except Exception as e:
                 self.send_json_response({"error": str(e)}, 500)
         else:
             self.send_json_response({"error": "Not found"}, 404)

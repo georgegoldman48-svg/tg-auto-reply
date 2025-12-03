@@ -212,26 +212,31 @@ async def update_reply_state(conn: asyncpg.Connection, peer_id: int, message_id:
     """, ACCOUNT_ID, peer_id, message_id)
 
 
-async def generate_ai_response(prompt: str, peer_id: int, history: List[Dict[str, Any]]) -> Optional[str]:
+async def generate_ai_response(prompt: str, peer_id: int, history: List[Dict[str, Any]], peer_prompt: str = None) -> Optional[str]:
     """
     Получить ответ от AI сервера с учётом истории диалога.
-    
+
     Args:
         prompt: Текущее сообщение от пользователя
         peer_id: ID собеседника (для кэширования на стороне AI сервера)
         history: История диалога из БД
-    
+        peer_prompt: Промпт для конкретного пира из настроек бота
+
     Returns:
         str: Ответ от AI или None если сервер недоступен
     """
     try:
+        payload = {
+            "prompt": prompt,
+            "peer_id": peer_id,
+            "history": history
+        }
+        if peer_prompt:
+            payload["peer_prompt"] = peer_prompt
+
         async with http_session.post(
             f"{AI_SERVER_URL}/generate",
-            json={
-                "prompt": prompt,
-                "peer_id": peer_id,
-                "history": history
-            }
+            json=payload
         ) as resp:
             if resp.status == 200:
                 data = await resp.json()
@@ -295,9 +300,10 @@ async def process_auto_replies() -> int:
                 # Получаем историю диалога из БД
                 history = await get_conversation_history(conn, peer_id)
                 logger.info(f"Loaded {len(history)} messages from history")
-                
-                # Пробуем получить ответ от AI
-                reply_text = await generate_ai_response(message_text, peer_id, history)
+
+                # Пробуем получить ответ от AI (передаём промпт для пира)
+                peer_prompt = template  # template из auto_reply_rules
+                reply_text = await generate_ai_response(message_text, peer_id, history, peer_prompt)
                 
                 if reply_text:
                     logger.info(f"AI response: {reply_text[:50]}...")
