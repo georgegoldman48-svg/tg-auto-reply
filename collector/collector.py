@@ -217,11 +217,15 @@ async def handle_new_message(event) -> None:
     Обработчик новых входящих сообщений.
     Автоматически вызывается Telethon при получении нового сообщения.
     """
+    # Только личные сообщения (не группы/каналы)
+    if not event.is_private:
+        return
+
     msg = event.message
-    
+
     try:
         sender = await event.get_sender()
-        
+
         # Пропускаем не-пользователей и ботов
         if not isinstance(sender, User):
             return
@@ -246,12 +250,16 @@ async def handle_outgoing_message(event) -> None:
     Обработчик исходящих сообщений (моих ответов).
     Нужен для полноты истории переписки.
     """
+    # Только личные сообщения (не группы/каналы)
+    if not event.is_private:
+        return
+
     msg = event.message
-    
+
     try:
         # Для исходящих сообщений получаем чат (receiver)
         chat = await event.get_chat()
-        
+
         # Пропускаем не-пользователей и ботов
         if not isinstance(chat, User):
             return
