@@ -85,11 +85,11 @@ async def close_db() -> None:
 async def ensure_peer(conn: asyncpg.Connection, entity: User) -> int:
     """
     Создать или обновить запись о собеседнике в таблице peers.
-
+    
     Args:
         conn: Соединение с БД
         entity: Telegram User entity
-
+        
     Returns:
         int: Внутренний peer_id (peers.id)
     """
@@ -118,12 +118,12 @@ async def ensure_peer(conn: asyncpg.Connection, entity: User) -> int:
 async def save_message(conn: asyncpg.Connection, peer_id: int, msg) -> bool:
     """
     Сохранить сообщение в таблицу messages.
-
+    
     Args:
         conn: Соединение с БД
         peer_id: Внутренний ID из таблицы peers
         msg: Telethon Message object
-
+        
     Returns:
         bool: True если сообщение новое, False если уже существовало
     """
@@ -132,12 +132,12 @@ async def save_message(conn: asyncpg.Connection, peer_id: int, msg) -> bool:
     media_type = None
     if has_media:
         media_type = type(msg.media).__name__
-
+    
     # Получаем reply_to_msg_id если есть
     reply_to_id = None
     if msg.reply_to:
         reply_to_id = getattr(msg.reply_to, 'reply_to_msg_id', None)
-
+    
     try:
         result = await conn.execute("""
             INSERT INTO messages (peer_id, tg_message_id, from_me, date, text, reply_to_id, has_media, media_type, raw_json)
@@ -170,43 +170,43 @@ async def sync_history() -> None:
     logger.info("Starting history synchronization...")
     logger.info(f"Limit per peer: {HISTORY_LIMIT_PER_PEER} messages")
     logger.info("=" * 50)
-
+    
     total_dialogs = 0
     total_messages = 0
-
+    
     async with db_pool.acquire() as conn:
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
-
+            
             # Фильтр: только личные диалоги с пользователями (не боты, не группы, не каналы)
             if not isinstance(entity, User):
                 continue
             if getattr(entity, 'bot', False):
                 continue
-
+            
             total_dialogs += 1
             peer_id = await ensure_peer(conn, entity)
-
+            
             # Имя для логов
             display_name = entity.first_name or entity.username or f"ID:{entity.id}"
-
+            
             dialog_messages = 0
             try:
                 async for msg in client.iter_messages(entity, limit=HISTORY_LIMIT_PER_PEER):
                     if await save_message(conn, peer_id, msg):
                         dialog_messages += 1
                         total_messages += 1
-
+                    
                     # Логируем прогресс каждые 100 сообщений
                     if dialog_messages > 0 and dialog_messages % 100 == 0:
                         logger.info(f"  [{display_name}] {dialog_messages} messages saved...")
             except Exception as e:
                 logger.error(f"Error syncing dialog with {display_name}: {e}")
                 continue
-
+            
             if dialog_messages > 0:
                 logger.info(f"[{display_name}] Total: {dialog_messages} new messages")
-
+    
     logger.info("=" * 50)
     logger.info(f"History sync complete: {total_dialogs} dialogs, {total_messages} new messages")
     logger.info("=" * 50)
@@ -231,16 +231,16 @@ async def handle_new_message(event) -> None:
             return
         if getattr(sender, 'bot', False):
             return
-
+        
         async with db_pool.acquire() as conn:
             peer_id = await ensure_peer(conn, sender)
             is_new = await save_message(conn, peer_id, msg)
-
+            
             if is_new:
                 display_name = sender.first_name or sender.username or f"ID:{sender.id}"
                 text_preview = (msg.message or "[media]")[:50]
                 logger.info(f"[IN] {display_name}: {text_preview}")
-
+    
     except Exception as e:
         logger.error(f"Error handling incoming message: {e}")
 
@@ -265,16 +265,16 @@ async def handle_outgoing_message(event) -> None:
             return
         if getattr(chat, 'bot', False):
             return
-
+        
         async with db_pool.acquire() as conn:
             peer_id = await ensure_peer(conn, chat)
             is_new = await save_message(conn, peer_id, msg)
-
+            
             if is_new:
                 display_name = chat.first_name or chat.username or f"ID:{chat.id}"
                 text_preview = (msg.message or "[media]")[:50]
                 logger.info(f"[OUT] -> {display_name}: {text_preview}")
-
+    
     except Exception as e:
         logger.error(f"Error handling outgoing message: {e}")
 
@@ -282,21 +282,21 @@ async def handle_outgoing_message(event) -> None:
 async def main() -> None:
     """Главная функция collector"""
     global client
-
+    
     logger.info("=" * 60)
     logger.info("Telegram Collector v1.0")
     logger.info("=" * 60)
     logger.info(f"Session path: {SESSION_PATH}")
     logger.info(f"Phone: {PHONE}")
     logger.info("=" * 60)
-
+    
     # Инициализация БД
     await init_db()
     logger.info("Database connected")
-
+    
     # Инициализация Telethon клиента
     client = TelegramClient(SESSION_PATH, int(API_ID), API_HASH)
-
+    
     # Регистрация обработчиков событий
     client.add_event_handler(
         handle_new_message,
@@ -306,23 +306,23 @@ async def main() -> None:
         handle_outgoing_message,
         events.NewMessage(outgoing=True)
     )
-
+    
     # Подключение к Telegram
     await client.start(phone=PHONE)
     logger.info("Telegram client connected")
-
+    
     # Информация о текущем аккаунте
     me = await client.get_me()
     logger.info(f"Logged in as: {me.first_name} (@{me.username or 'no username'}) [ID: {me.id}]")
-
+    
     # Синхронизация истории (раскомментируй при первом запуске)
     # await sync_history()
-
+    
     logger.info("=" * 60)
     logger.info("Collector started. Listening for new messages...")
     logger.info("Press Ctrl+C to stop")
     logger.info("=" * 60)
-
+    
     try:
         await client.run_until_disconnected()
     except KeyboardInterrupt:

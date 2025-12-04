@@ -7,6 +7,11 @@ Web UI для тестирования AI автоответчика.
 
 Открыть в браузере:
     http://localhost:8081
+
+Поддерживает:
+- Выбор AI движка (local SambaLingo / Claude API)
+- Настройки system prompt, temperature
+- Тестирование через локальный AI сервер
 """
 
 import json
@@ -14,15 +19,9 @@ import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-AI_SERVER = "http://localhost:8080"
+AI_SERVER = "http://localhost:8080"  # Локальный AI сервер
+VPS3_SETTINGS_API = "http://188.116.27.68:8085"  # Settings API на VPS3
 PORT = 8081
-
-# Текущие настройки (можно менять через UI)
-current_settings = {
-    "system_prompt": "Ты Егор. Отвечаешь коротко, живо, по делу. Без воды и официоза.",
-    "temperature": 0.7,
-    "max_tokens": 100
-}
 
 HTML_PAGE = '''<!DOCTYPE html>
 <html lang="ru">
@@ -80,7 +79,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         .chat-box {
-            height: 400px;
+            height: 350px;
             overflow-y: auto;
             background: #0f0f23;
             border-radius: 8px;
@@ -101,6 +100,9 @@ HTML_PAGE = '''<!DOCTYPE html>
         .message.assistant {
             background: #333;
             border-bottom-left-radius: 4px;
+        }
+        .message.claude {
+            background: #6b4c9a;
         }
         .message .meta {
             font-size: 0.75em;
@@ -142,7 +144,7 @@ HTML_PAGE = '''<!DOCTYPE html>
             color: #aaa;
             font-size: 0.9em;
         }
-        .settings textarea, .settings input {
+        .settings textarea, .settings input[type="text"] {
             width: 100%;
             padding: 10px;
             border: none;
@@ -152,8 +154,36 @@ HTML_PAGE = '''<!DOCTYPE html>
             margin-bottom: 15px;
             font-family: inherit;
         }
-        .settings textarea { height: 100px; resize: vertical; }
+        .settings textarea { height: 80px; resize: vertical; }
         .settings input[type="range"] { padding: 0; }
+
+        .engine-toggle {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+        .engine-btn {
+            flex: 1;
+            padding: 10px;
+            border: 2px solid #333;
+            border-radius: 8px;
+            background: #0f0f23;
+            color: #888;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-align: center;
+        }
+        .engine-btn:hover { border-color: #555; }
+        .engine-btn.active {
+            border-color: #00d4ff;
+            color: #00d4ff;
+            background: rgba(0, 212, 255, 0.1);
+        }
+        .engine-btn.active.claude {
+            border-color: #9b59b6;
+            color: #9b59b6;
+            background: rgba(155, 89, 182, 0.1);
+        }
 
         .range-row {
             display: flex;
@@ -194,6 +224,15 @@ HTML_PAGE = '''<!DOCTYPE html>
             transition: background 0.2s;
         }
         .example-btn:hover { background: #444; }
+
+        .sync-status {
+            font-size: 0.75em;
+            color: #888;
+            margin-top: 10px;
+            text-align: center;
+        }
+        .sync-status.success { color: #00ff88; }
+        .sync-status.error { color: #ff4444; }
     </style>
 </head>
 <body>
@@ -221,7 +260,19 @@ HTML_PAGE = '''<!DOCTYPE html>
             </div>
 
             <div class="panel settings">
-                <h2>Настройки</h2>
+                <h2>Настройки AI</h2>
+
+                <label>AI Движок:</label>
+                <div class="engine-toggle">
+                    <div class="engine-btn" id="engineLocal" onclick="setEngine('local')">
+                        <div>Local</div>
+                        <div style="font-size:0.75em;color:#666;">SambaLingo</div>
+                    </div>
+                    <div class="engine-btn" id="engineClaude" onclick="setEngine('claude')">
+                        <div>Claude</div>
+                        <div style="font-size:0.75em;color:#666;">API</div>
+                    </div>
+                </div>
 
                 <label>System Prompt:</label>
                 <textarea id="systemPrompt">Ты Егор. Отвечаешь коротко, живо, по делу. Без воды и официоза.</textarea>
@@ -234,20 +285,24 @@ HTML_PAGE = '''<!DOCTYPE html>
 
                 <label>Max Tokens:</label>
                 <div class="range-row">
-                    <input type="range" id="maxTokens" min="20" max="200" step="10" value="100" oninput="updateTokensDisplay()">
+                    <input type="range" id="maxTokens" min="20" max="500" step="10" value="100" oninput="updateTokensDisplay()">
                     <span class="range-value" id="tokensValue">100</span>
                 </div>
 
                 <div class="btn-row">
                     <button onclick="saveSettings()">Сохранить</button>
-                    <button class="btn-secondary" onclick="clearChat()">Очистить чат</button>
+                    <button class="btn-secondary" onclick="loadVPS3Settings()">Загрузить</button>
+                    <button class="btn-secondary" onclick="clearChat()">Очистить</button>
                 </div>
+
+                <div class="sync-status" id="syncStatus"></div>
             </div>
         </div>
     </div>
 
     <script>
         let chatHistory = [];
+        let currentEngine = 'local';
 
         async function checkHealth() {
             const statusEl = document.getElementById('status');
@@ -255,25 +310,38 @@ HTML_PAGE = '''<!DOCTYPE html>
                 const resp = await fetch('/api/health');
                 const data = await resp.json();
                 if (data.ready) {
-                    statusEl.textContent = `Online: ${data.model} | GPU: ${data.gpu}`;
+                    const engineInfo = currentEngine === 'claude' ? 'Claude API' : `Local: ${data.model}`;
+                    statusEl.textContent = `${engineInfo} | GPU: ${data.gpu}`;
                     statusEl.className = 'status online';
                 } else {
                     statusEl.textContent = 'Модель загружается...';
                     statusEl.className = 'status offline';
                 }
             } catch (e) {
-                statusEl.textContent = 'AI сервер недоступен';
-                statusEl.className = 'status offline';
+                statusEl.textContent = currentEngine === 'claude' ? 'Claude API (локальный AI недоступен)' : 'AI сервер недоступен';
+                statusEl.className = currentEngine === 'claude' ? 'status online' : 'status offline';
             }
         }
 
-        function addMessage(text, role, time_ms = null) {
+        function setEngine(engine) {
+            currentEngine = engine;
+            document.getElementById('engineLocal').className = engine === 'local' ? 'engine-btn active' : 'engine-btn';
+            document.getElementById('engineClaude').className = engine === 'claude' ? 'engine-btn active claude' : 'engine-btn';
+            checkHealth();
+        }
+
+        function addMessage(text, role, time_ms = null, engine = null) {
             const chatBox = document.getElementById('chatBox');
             const div = document.createElement('div');
-            div.className = `message ${role}`;
+            let className = `message ${role}`;
+            if (role === 'assistant' && engine === 'claude') {
+                className += ' claude';
+            }
+            div.className = className;
             let html = text;
             if (time_ms !== null) {
-                html += `<div class="meta">${time_ms}ms</div>`;
+                const engineLabel = engine ? ` (${engine})` : '';
+                html += `<div class="meta">${time_ms}ms${engineLabel}</div>`;
             }
             div.innerHTML = html;
             chatBox.appendChild(div);
@@ -301,14 +369,15 @@ HTML_PAGE = '''<!DOCTYPE html>
                         history: chatHistory.slice(-10),
                         system_prompt: document.getElementById('systemPrompt').value,
                         temperature: parseFloat(document.getElementById('temperature').value),
-                        max_tokens: parseInt(document.getElementById('maxTokens').value)
+                        max_tokens: parseInt(document.getElementById('maxTokens').value),
+                        engine: currentEngine
                     })
                 });
                 const data = await resp.json();
                 const time_ms = Date.now() - start;
 
                 if (data.response) {
-                    addMessage(data.response, 'assistant', time_ms);
+                    addMessage(data.response, 'assistant', time_ms, data.engine || currentEngine);
                     chatHistory.push({role: 'assistant', content: data.response});
                 } else if (data.error) {
                     addMessage(`Ошибка: ${data.error}`, 'assistant');
@@ -336,20 +405,89 @@ HTML_PAGE = '''<!DOCTYPE html>
 
         async function saveSettings() {
             const settings = {
+                ai_engine: currentEngine,
                 system_prompt: document.getElementById('systemPrompt').value,
                 temperature: parseFloat(document.getElementById('temperature').value),
                 max_tokens: parseInt(document.getElementById('maxTokens').value)
             };
+
+            const syncStatus = document.getElementById('syncStatus');
+
             try {
-                await fetch('/api/settings', {
+                // Сохраняем на VPS3 (глобально для Telegram)
+                const resp = await fetch('/api/vps3/settings', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(settings)
                 });
-                alert('Настройки сохранены!');
+                const data = await resp.json();
+
+                if (data.error) {
+                    syncStatus.textContent = 'Ошибка сохранения на VPS3: ' + data.error;
+                    syncStatus.className = 'sync-status error';
+                } else {
+                    syncStatus.textContent = 'Настройки сохранены на VPS3';
+                    syncStatus.className = 'sync-status success';
+
+                    // Также синхронизируем с локальным AI сервером
+                    try {
+                        await fetch('/api/settings', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({
+                                system_prompt: settings.system_prompt,
+                                temperature: settings.temperature,
+                                max_tokens: settings.max_tokens
+                            })
+                        });
+                    } catch (e) {
+                        // Игнорируем ошибки локального сервера
+                    }
+                }
             } catch (e) {
-                alert('Ошибка сохранения');
+                syncStatus.textContent = 'Ошибка: ' + e.message;
+                syncStatus.className = 'sync-status error';
             }
+
+            setTimeout(() => { syncStatus.textContent = ''; }, 5000);
+        }
+
+        async function loadVPS3Settings() {
+            const syncStatus = document.getElementById('syncStatus');
+
+            try {
+                const resp = await fetch('/api/vps3/settings');
+                const data = await resp.json();
+
+                if (data.error) {
+                    syncStatus.textContent = 'Ошибка загрузки: ' + data.error;
+                    syncStatus.className = 'sync-status error';
+                    return;
+                }
+
+                if (data.ai_engine) {
+                    setEngine(data.ai_engine);
+                }
+                if (data.system_prompt) {
+                    document.getElementById('systemPrompt').value = data.system_prompt;
+                }
+                if (data.temperature) {
+                    document.getElementById('temperature').value = data.temperature;
+                    updateTempDisplay();
+                }
+                if (data.max_tokens) {
+                    document.getElementById('maxTokens').value = data.max_tokens;
+                    updateTokensDisplay();
+                }
+
+                syncStatus.textContent = 'Настройки загружены с VPS3';
+                syncStatus.className = 'sync-status success';
+            } catch (e) {
+                syncStatus.textContent = 'Ошибка: ' + e.message;
+                syncStatus.className = 'sync-status error';
+            }
+
+            setTimeout(() => { syncStatus.textContent = ''; }, 5000);
         }
 
         function clearChat() {
@@ -358,6 +496,33 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         async function loadSettings() {
+            // Сначала пробуем загрузить с VPS3
+            try {
+                const resp = await fetch('/api/vps3/settings');
+                const data = await resp.json();
+
+                if (!data.error) {
+                    if (data.ai_engine) {
+                        setEngine(data.ai_engine);
+                    }
+                    if (data.system_prompt) {
+                        document.getElementById('systemPrompt').value = data.system_prompt;
+                    }
+                    if (data.temperature) {
+                        document.getElementById('temperature').value = data.temperature;
+                        updateTempDisplay();
+                    }
+                    if (data.max_tokens) {
+                        document.getElementById('maxTokens').value = data.max_tokens;
+                        updateTokensDisplay();
+                    }
+                    return;
+                }
+            } catch (e) {
+                console.error('Failed to load VPS3 settings:', e);
+            }
+
+            // Fallback: загружаем с локального AI сервера
             try {
                 const resp = await fetch('/api/settings');
                 const data = await resp.json();
@@ -378,6 +543,7 @@ HTML_PAGE = '''<!DOCTYPE html>
         }
 
         // Инициализация
+        setEngine('local');
         checkHealth();
         loadSettings();
         setInterval(checkHealth, 10000);
@@ -422,6 +588,14 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     self.send_json(data)
             except Exception as e:
                 self.send_json({"error": str(e)})
+        elif self.path == "/api/vps3/settings":
+            try:
+                req = urllib.request.Request(f"{VPS3_SETTINGS_API}/api/settings")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
+                    self.send_json(data)
+            except Exception as e:
+                self.send_json({"error": str(e)})
         else:
             self.send_json({"error": "Not found"}, 404)
 
@@ -433,7 +607,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
 
-                # Отправляем запрос к AI серверу
+                # Отправляем запрос к AI серверу (только local движок тестируем здесь)
                 payload = json.dumps({
                     "prompt": data.get("prompt", ""),
                     "history": data.get("history", []),
@@ -448,6 +622,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
 
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     result = json.loads(resp.read().decode())
+                    result["engine"] = "local"
                     self.send_json(result)
 
             except urllib.error.URLError as e:
@@ -459,7 +634,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
 
-                # Отправляем настройки на AI сервер (глобально для всех)
+                # Отправляем настройки на локальный AI сервер
                 payload = json.dumps(data).encode("utf-8")
                 req = urllib.request.Request(
                     f"{AI_SERVER}/settings",
@@ -475,6 +650,28 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": f"AI сервер недоступен: {e}"}, 500)
             except Exception as e:
                 self.send_json({"error": str(e)}, 400)
+
+        elif self.path == "/api/vps3/settings":
+            try:
+                data = json.loads(body)
+
+                # Отправляем настройки на VPS3 Settings API
+                payload = json.dumps(data).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{VPS3_SETTINGS_API}/api/settings",
+                    data=payload,
+                    headers={"Content-Type": "application/json"}
+                )
+
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    result = json.loads(resp.read().decode())
+                    self.send_json(result)
+
+            except urllib.error.URLError as e:
+                self.send_json({"error": f"VPS3 недоступен: {e}"}, 500)
+            except Exception as e:
+                self.send_json({"error": str(e)}, 400)
+
         else:
             self.send_json({"error": "Not found"}, 404)
 
@@ -485,6 +682,7 @@ def main():
     print(f"=" * 50)
     print(f"Открой в браузере: http://localhost:{PORT}")
     print(f"AI Server: {AI_SERVER}")
+    print(f"VPS3 Settings: {VPS3_SETTINGS_API}")
     print(f"=" * 50)
 
     server = HTTPServer(("0.0.0.0", PORT), WebUIHandler)

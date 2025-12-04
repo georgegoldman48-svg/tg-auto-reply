@@ -341,7 +341,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("⛔ Доступ запрещён.")
         return
     await state.clear()
-    await message.answer("🤖 Auto-Reply v3.3", reply_markup=main_menu_keyboard())
+    await message.answer("🤖 Auto-Reply v3.0", reply_markup=main_menu_keyboard())
 
 
 @dp.message(Command("help"))
@@ -1606,7 +1606,7 @@ async def close_telethon():
 
 async def main():
     global telethon_client
-    logger.info("Admin Bot v3.3")
+    logger.info("Admin Bot v3.1")
     await init_db()
     await init_telethon()
     try:

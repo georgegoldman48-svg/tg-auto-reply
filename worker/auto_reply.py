@@ -396,11 +396,11 @@ async def increment_new_contact_reply(conn: asyncpg.Connection, peer_id: int) ->
 async def get_conversation_history(conn: asyncpg.Connection, peer_id: int) -> List[Dict[str, Any]]:
     """
     Получить историю диалога с peer из БД.
-
+    
     Возвращает последние HISTORY_LIMIT сообщений в хронологическом порядке.
     """
     rows = await conn.fetch("""
-        SELECT
+        SELECT 
             from_me,
             text,
             date
@@ -409,7 +409,7 @@ async def get_conversation_history(conn: asyncpg.Connection, peer_id: int) -> Li
         ORDER BY date DESC
         LIMIT $2
     """, peer_id, HISTORY_LIMIT)
-
+    
     # Переворачиваем чтобы был хронологический порядок (старые → новые)
     history = []
     for row in reversed(rows):
@@ -417,7 +417,7 @@ async def get_conversation_history(conn: asyncpg.Connection, peer_id: int) -> Li
             "role": "assistant" if row["from_me"] else "user",
             "content": row["text"]
         })
-
+    
     return history
 
 
@@ -801,7 +801,7 @@ async def check_ai_server() -> bool:
 async def main() -> None:
     """Главная функция worker"""
     global client
-
+    
     logger.info("=" * 60)
     logger.info("Auto-Reply Worker v2.11 (reply_mode per contact)")
     logger.info("=" * 60)
@@ -812,24 +812,24 @@ async def main() -> None:
     logger.info(f"Fallback message: {FALLBACK_MESSAGE}")
     logger.info(f"Session path: {SESSION_PATH}")
     logger.info("=" * 60)
-
+    
     # Инициализация БД
     await init_db()
     logger.info("Database connected")
-
+    
     # Инициализация HTTP
     await init_http()
-
+    
     # Проверка AI сервера
     if await check_ai_server():
         logger.info("✓ AI server is available")
     else:
         logger.warning("✗ AI server is not available (will use fallback)")
-
+    
     # Инициализация Telethon клиента
     client = TelegramClient(SESSION_PATH, int(API_ID), API_HASH)
     await client.start(phone=PHONE)
-
+    
     # Информация о текущем аккаунте
     me = await client.get_me()
     my_id = me.id
