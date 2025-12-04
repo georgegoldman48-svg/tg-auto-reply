@@ -1,4 +1,4 @@
-# Telegram Auto-Reply Service v2.0
+# Telegram Auto-Reply Service v2.1
 
 > Интеллектуальный автоответчик для Telegram с AI интеграцией
 
@@ -277,6 +277,39 @@ sudo journalctl -u admin-bot -f
 2. Для Claude: проверить `claude_api_key`
 3. Для Local: проверить SSH туннель на порт 8080
 
+## Local AI Setup (опционально)
+
+Для использования локальной модели (Qwen + LoRA) вместо Claude:
+
+### 1. На локальном компьютере (с GPU)
+```bash
+# Установить Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Создать модель из обученного LoRA
+cd ~/qwen-egor-merged
+ollama create egor -f Modelfile
+
+# Запустить AI сервер
+cd ~/Downloads/tg-auto-reply
+python ai_server.py
+# Сервер на порту 8080
+```
+
+### 2. SSH туннель к VPS
+```bash
+ssh -N -R 8080:localhost:8080 root@188.116.27.68
+```
+
+### 3. Проверить с VPS
+```bash
+curl http://localhost:8080/health
+# {"status":"healthy","model":"egor:latest","ready":true}
+```
+
+### Auto-fallback
+Если Local AI недоступен (выключен компьютер, оборвался туннель), Worker автоматически использует Claude API как fallback. Настройка `ai_engine=local` предпочитает Local, но не блокирует работу при его недоступности
+
 ### Контакт не в списке
 1. Должен быть в папке Personal ИЛИ написать вам в ЛС
 2. Синхронизировать: Admin Bot → Синхронизация
@@ -335,12 +368,22 @@ GET  /stats                    - Статистика
 
 ## Changelog
 
+### v2.1 (2024-12-05)
+- **Local AI**: Поддержка обученной модели Qwen + LoRA через SSH туннель
+- **Auto-fallback**: Если Local AI недоступен → автоматический fallback на Claude API
+- **Admin Bot v3.3**:
+  - Кнопка "Помощь" с полным руководством
+  - Кнопка отмены при вводе промптов/шаблонов
+  - Цветовая индикация режимов (🟢 AI, 🟡 Шаблон, ⚪ Выкл)
+  - Объединённые разделы Статус + Настройки системы
+- **AI Server v2.0**: FastAPI сервер для Local AI с Ollama backend
+
 ### v2.0 (2024-12)
 - AI интеграция (Claude API + Local)
 - Per-contact reply_mode (ai/template/off)
 - Personal folder синхронизация
 - Лимиты для новых контактов
-- Admin Bot v3.3 с карточками контактов
+- Admin Bot v3.0 с карточками контактов
 
 ### v1.0 (2024-11)
 - MVP автоответчик

@@ -51,7 +51,7 @@ AI_SERVER_URL = os.getenv('AI_SERVER_URL', 'http://localhost:8080')
 
 # Claude API
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-CLAUDE_MODEL = "claude-sonnet-4-20250514"
+CLAUDE_MODEL = "claude-3-5-haiku-20241022"
 
 # Fallback сообщение если AI недоступен
 FALLBACK_MESSAGE = os.getenv('FALLBACK_MESSAGE', 'Сейчас занят')
@@ -586,6 +586,8 @@ async def generate_ai_response(
     """
     Получить ответ от AI с учётом выбранного движка.
 
+    ВАЖНО: Если выбран local и он недоступен — автоматически fallback на Claude.
+
     Args:
         prompt: Текущее сообщение от пользователя
         peer_id: ID собеседника
@@ -599,11 +601,28 @@ async def generate_ai_response(
     engine = settings.get('ai_engine', 'local')
 
     if engine == 'claude':
+        # Только Claude
         logger.info(f"Using Claude API (model: {CLAUDE_MODEL})")
         return await generate_claude_response(prompt, history, settings, peer_prompt)
     else:
-        logger.info("Using local AI (SambaLingo + LoRA)")
-        return await generate_local_response(prompt, peer_id, history, peer_prompt)
+        # Local с автоматическим fallback на Claude
+        logger.info("Using local AI (Qwen + LoRA via SSH tunnel)")
+        response = await generate_local_response(prompt, peer_id, history, peer_prompt)
+
+        if response:
+            return response
+
+        # Local недоступен — fallback на Claude
+        logger.warning("Local AI unavailable, falling back to Claude API")
+        claude_response = await generate_claude_response(prompt, history, settings, peer_prompt)
+
+        if claude_response:
+            logger.info(f"Claude fallback response: {claude_response[:50]}...")
+            return claude_response
+
+        # Ни local, ни Claude не сработали
+        logger.error("Both local AI and Claude API unavailable")
+        return None
 
 
 async def send_reply(tg_peer_id: int, text: str, reply_to_msg_id: int = None) -> bool:

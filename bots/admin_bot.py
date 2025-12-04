@@ -83,6 +83,10 @@ class NewContactState(StatesGroup):
     waiting_prompt = State()
 
 
+class PeerTemplateState(StatesGroup):
+    waiting_template = State()
+
+
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5, command_timeout=60)
@@ -103,29 +107,21 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="📊 Статус", callback_data="status"),
-            InlineKeyboardButton(text="📈 Стат", callback_data="stats")
-        ],
-        [
-            InlineKeyboardButton(text="🟢 Авто ON", callback_data="auto_on"),
-            InlineKeyboardButton(text="🔴 Авто OFF", callback_data="auto_off")
-        ],
-        [
-            InlineKeyboardButton(text="🤖 AI ON", callback_data="ai_on"),
-            InlineKeyboardButton(text="🚫 AI OFF", callback_data="ai_off")
+            InlineKeyboardButton(text="⚙️ Настройки", callback_data="system_settings")
         ],
         [
             InlineKeyboardButton(text="📋 Правила", callback_data="rules"),
             InlineKeyboardButton(text="👥 Контакты", callback_data="peers:0")
         ],
         [
-            InlineKeyboardButton(text="⚙️ AI настройки", callback_data="ai_settings")
+            InlineKeyboardButton(text="🤖 AI настройки", callback_data="ai_settings")
         ],
         [
             InlineKeyboardButton(text="📇 Синхронизация", callback_data="sync_personal"),
-            InlineKeyboardButton(text="👤 Новые контакты", callback_data="newcontact_settings")
+            InlineKeyboardButton(text="🔍 Поиск", callback_data="search_help")
         ],
         [
-            InlineKeyboardButton(text="🔍 Поиск", callback_data="search_help")
+            InlineKeyboardButton(text="❓ Помощь", callback_data="help")
         ]
     ])
 
@@ -133,6 +129,13 @@ def main_menu_keyboard():
 def back_button():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Меню", callback_data="menu")]
+    ])
+
+
+def cancel_button(callback_data: str = "menu"):
+    """Кнопка отмены при вводе текста"""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=callback_data)]
     ])
 
 
@@ -172,68 +175,82 @@ def temp_keyboard(current_temp: float):
 
 
 def newcontact_settings_keyboard(current_mode: str):
-    """Клавиатура настроек для новых контактов"""
-    mode_labels = {
-        'off': '⚫ OFF',
-        'template': '📝 Template',
-        'ai': '🤖 AI'
-    }
+    """Клавиатура настроек для новых контактов (как карточка контакта)
 
+    3 режима:
+    - 🟢 AI — ответ через AI
+    - 🟡 Шаблон — фиксированный ответ
+    - ⚪ Выкл — автоответ отключен
+    """
+    keyboard = []
+
+    # Кнопки режимов — всегда видны
     mode_row = []
-    for mode, label in mode_labels.items():
-        icon = "✅" if current_mode == mode else "⚪"
-        text = f"{icon} {label.split()[1]}" if icon == "✅" else label
+    modes = [('ai', '🟢', 'AI'), ('template', '🟡', 'Шаблон'), ('off', '⚪', 'Выкл')]
+    for mode, icon, label in modes:
+        is_active = (current_mode == mode)
+        text = f"✅ {label}" if is_active else f"{icon} {label}"
         mode_row.append(InlineKeyboardButton(text=text, callback_data=f"nc_mode:{mode}"))
+    keyboard.append(mode_row)
 
-    return InlineKeyboardMarkup(inline_keyboard=[
-        mode_row,
-        [
-            InlineKeyboardButton(text="✏️ Шаблон", callback_data="nc_template"),
-            InlineKeyboardButton(text="📝 AI Промпт", callback_data="nc_prompt")
-        ],
-        [InlineKeyboardButton(text="◀️ Меню", callback_data="menu")]
-    ])
+    # Кнопка редактирования — зависит от режима
+    if current_mode == 'ai':
+        keyboard.append([
+            InlineKeyboardButton(text="✏️ Задать промпт", callback_data="nc_prompt")
+        ])
+    elif current_mode == 'template':
+        keyboard.append([
+            InlineKeyboardButton(text="✏️ Задать шаблон", callback_data="nc_template")
+        ])
+
+    keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="system_settings")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def peer_settings_keyboard(peer_id: int, has_rule: bool, in_personal: bool = False, reply_mode: str = None):
-    """Клавиатура настроек контакта с выбором режима"""
+    """Клавиатура настроек контакта с выбором режима
+
+    3 режима (один из трёх):
+    - 🟢 AI — ответ через AI
+    - 🟡 Шаблон — фиксированный ответ
+    - ⚪ Выкл — автоответ отключен
+    """
     keyboard = []
 
-    if has_rule and reply_mode:
-        # Есть правило — показываем выбор режима
-        mode_icons = {'ai': '🤖', 'template': '📝', 'off': '⚫'}
-        mode_row = []
-        for mode in ['ai', 'template', 'off']:
-            icon = mode_icons[mode]
-            is_active = (reply_mode == mode)
-            text = f"{'✅' if is_active else icon} {mode.upper()}"
-            mode_row.append(InlineKeyboardButton(text=text, callback_data=f"mode:{peer_id}:{mode}"))
-        keyboard.append(mode_row)
+    # Определяем текущий режим (если нет правила — off)
+    current_mode = reply_mode if has_rule else 'off'
 
-        # Кнопка редактирования промпта
-        keyboard.append([
-            InlineKeyboardButton(text="✏️ Редактировать промпт", callback_data=f"prompt:{peer_id}")
-        ])
-    else:
-        # Нет правила — показываем кнопку включения
-        keyboard.append([
-            InlineKeyboardButton(text="🟢 Включить автоответ", callback_data=f"rule_on:{peer_id}")
-        ])
+    # Кнопки режимов — всегда видны
+    mode_row = []
+    modes = [('ai', '🟢', 'AI'), ('template', '🟡', 'Шаблон'), ('off', '⚪', 'Выкл')]
+    for mode, icon, label in modes:
+        is_active = (current_mode == mode)
+        text = f"✅ {label}" if is_active else f"{icon} {label}"
+        mode_row.append(InlineKeyboardButton(text=text, callback_data=f"mode:{peer_id}:{mode}"))
+    keyboard.append(mode_row)
 
-    # Статус Personal
-    status_icon = "📍" if in_personal else "👤"
-    status_text = "Personal" if in_personal else "Новый"
-    keyboard.append([
-        InlineKeyboardButton(text=f"{status_icon} {status_text}", callback_data="noop"),
-        InlineKeyboardButton(text="🔄", callback_data=f"peer:{peer_id}")
-    ])
+    # Кнопка редактирования — зависит от режима
+    if current_mode == 'ai':
+        keyboard.append([
+            InlineKeyboardButton(text="✏️ Задать промпт", callback_data=f"prompt:{peer_id}")
+        ])
+    elif current_mode == 'template':
+        keyboard.append([
+            InlineKeyboardButton(text="✏️ Задать шаблон", callback_data=f"template:{peer_id}")
+        ])
 
     keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="peers:0")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
 def peers_keyboard(peers: list, offset: int, total: int, max_new: int = 5):
-    """Клавиатура со списком контактов с индикаторами"""
+    """Клавиатура со списком контактов с индикаторами
+
+    Индикаторы по режиму:
+    - 🟢 — reply_mode = 'ai'
+    - 🟡 — reply_mode = 'template'
+    - ⚪ — reply_mode = 'off' или нет правила
+    """
     keyboard = []
 
     for i in range(0, len(peers), 2):
@@ -241,41 +258,51 @@ def peers_keyboard(peers: list, offset: int, total: int, max_new: int = 5):
         for j in range(2):
             if i + j < len(peers):
                 p = peers[i + j]
-                name = p['first_name'] or p['username'] or "—"
-                has_rule = p['has_rule']
-                in_personal = p.get('in_personal', False)
-                new_replies = p.get('new_replies', 0)
+                name = p['first_name'] or "—"
+                username = p.get('username')
+                reply_mode = p.get('reply_mode', None)
 
-                # Формируем индикатор
-                if has_rule:
-                    if in_personal:
-                        icon = "✅📍"  # правило + Personal
-                    else:
-                        icon = "✅👤"  # правило, но не в Personal
+                # Индикатор по режиму
+                if reply_mode == 'ai':
+                    icon = "🟢"
+                elif reply_mode == 'template':
+                    icon = "🟡"
                 else:
-                    if in_personal:
-                        icon = "⚪📍"  # нет правила, в Personal
-                    else:
-                        icon = f"⚪👤({new_replies}/{max_new})"  # новый контакт
+                    icon = "⚪"
 
-                # Короткое имя
-                display_name = name[:10]
-                btn_text = f"{icon}{display_name}"[:20]
+                # Формат: "🟢 Имя · @user" или "🟢 Имя"
+                if username:
+                    # С username - ограничиваем длину
+                    max_name_len = 22 - len(icon) - 2 - len(f" · @{username}")  # icon + space + " · @user"
+                    if max_name_len < 3:
+                        max_name_len = 3
+                    display_name = name[:max_name_len]
+                    btn_text = f"{icon} {display_name} · @{username}"[:22]
+                else:
+                    # Без username
+                    display_name = name[:18]
+                    btn_text = f"{icon} {display_name}"[:22]
 
                 row.append(InlineKeyboardButton(text=btn_text, callback_data=f"peer:{p['id']}"))
         if row:
             keyboard.append(row)
 
+    # Навигация: [◀️] [1/5] [▶️]
+    page = offset // PEERS_PER_PAGE + 1
+    total_pages = (total + PEERS_PER_PAGE - 1) // PEERS_PER_PAGE
+
     nav_row = []
     if offset > 0:
         nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"peers:{offset - PEERS_PER_PAGE}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text="◁", callback_data="noop"))  # серая стрелка
 
-    page = offset // PEERS_PER_PAGE + 1
-    total_pages = (total + PEERS_PER_PAGE - 1) // PEERS_PER_PAGE
     nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="noop"))
 
     if offset + PEERS_PER_PAGE < total:
         nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"peers:{offset + PEERS_PER_PAGE}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text="▷", callback_data="noop"))  # серая стрелка
 
     keyboard.append(nav_row)
     keyboard.append([
@@ -621,6 +648,10 @@ async def show_status(target):
             peers = await conn.fetchval("SELECT COUNT(*) FROM peers WHERE is_bot = false")
             msgs = await conn.fetchval("SELECT COUNT(*) FROM messages")
 
+            # Статистика за сегодня
+            today_msgs = await conn.fetchval("SELECT COUNT(*) FROM messages WHERE date >= CURRENT_DATE")
+            today_auto = await conn.fetchval("SELECT COUNT(*) FROM auto_reply_state WHERE last_reply_time >= CURRENT_DATE")
+
         # Добавляем AI настройки в статус
         ai_settings = await get_ai_settings()
         engine = ai_settings['ai_engine']
@@ -635,7 +666,8 @@ async def show_status(target):
             f"🌡️ Temp: {temp}\n\n"
             f"📋 Правил: {rules}\n"
             f"👥 Контактов: {peers}\n"
-            f"💬 Сообщений: {msgs}"
+            f"💬 Сообщений: {msgs}\n\n"
+            f"📅 Сегодня: {today_msgs} сообщ. | {today_auto or 0} автоотв."
         )
 
         if isinstance(target, CallbackQuery):
@@ -697,7 +729,7 @@ async def show_rules(target):
     try:
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT p.first_name, p.username, r.template
+                SELECT p.first_name, p.username, r.template, r.reply_mode
                 FROM auto_reply_rules r
                 JOIN peers p ON p.id = r.peer_id
                 WHERE r.account_id = $1 AND r.enabled = true
@@ -707,12 +739,30 @@ async def show_rules(target):
         if not rows:
             text = "📋 Нет активных правил"
         else:
-            text = f"📋 Активные правила ({len(rows)}):\n\n"
+            text = f"📋 Активные правила ({len(rows)})\n"
+            text += "━━━━━━━━━━━━━━━━\n"
+            text += "🟢 AI  🟡 Шаблон  ⚪ Выкл\n"
+            text += "━━━━━━━━━━━━━━━━\n\n"
             for r in rows:
                 name = r['first_name'] or "—"
                 user = f"@{r['username']}" if r['username'] else ""
-                prompt = (r['template'] or "—")[:20]
-                text += f"✅ {name} {user}\n   📝 {prompt}\n\n"
+                reply_mode = r['reply_mode'] or 'ai'
+                template = r['template'] or ""
+
+                # Индикатор по режиму
+                if reply_mode == 'ai':
+                    icon = "🟢"
+                elif reply_mode == 'template':
+                    icon = "🟡"
+                else:
+                    icon = "⚪"
+
+                # Показываем промпт/шаблон
+                prompt_text = template[:25] + "..." if len(template) > 25 else template
+                if not prompt_text:
+                    prompt_text = "(системный)" if reply_mode == 'ai' else "Сейчас занят"
+
+                text += f"{icon} {name} {user}\n   📝 {prompt_text}\n\n"
 
         if isinstance(target, CallbackQuery):
             await target.message.edit_text(text, reply_markup=back_button())
@@ -758,10 +808,10 @@ async def show_peers(target, offset: int = 0):
             rows = await conn.fetch("""
                 SELECT
                     p.id, p.tg_peer_id, p.username, p.first_name, p.in_personal,
-                    EXISTS(SELECT 1 FROM auto_reply_rules WHERE peer_id = p.id AND account_id = $1 AND enabled = true) as has_rule,
-                    COALESCE(rc.new_contact_replies, 0) as new_replies
+                    r.enabled as has_rule,
+                    r.reply_mode
                 FROM peers p
-                LEFT JOIN reply_counts rc ON rc.peer_id = p.id
+                LEFT JOIN auto_reply_rules r ON r.peer_id = p.id AND r.account_id = $1
                 WHERE p.is_bot = false
                 ORDER BY p.updated_at DESC
                 LIMIT $2 OFFSET $3
@@ -769,10 +819,9 @@ async def show_peers(target, offset: int = 0):
 
         peers = [dict(r) for r in rows]
         text = (
-            f"👥 Контакты\n\n"
-            f"✅📍 правило + Personal\n"
-            f"⚪📍 нет правила, Personal\n"
-            f"⚪👤 новый контакт (N/{max_new})"
+            f"👥 Контакты ({total})\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🟢 AI  🟡 Шаблон  ⚪ Выкл"
         )
 
         if isinstance(target, CallbackQuery):
@@ -790,21 +839,24 @@ async def cmd_peers(message: Message):
 
 
 async def show_peer_settings(target, peer_id: int):
-    """Показать карточку контакта с детальной информацией и фото"""
+    """Показать карточку контакта с детальной информацией и фото
+
+    3 режима:
+    - 🟢 AI — ответ через AI (по умолчанию: системный промпт)
+    - 🟡 Шаблон — фиксированный ответ (по умолчанию: "Сейчас занят")
+    - ⚪ Выкл — автоответ отключен
+    """
     try:
-        limits = await get_new_contact_limits()
-        max_new = limits['new_contact_max_replies']
-        max_daily = limits['daily_max_replies']
+        # Получаем системный промпт для дефолта
+        ai_settings = await get_ai_settings()
+        system_prompt = ai_settings.get('system_prompt', 'Отвечай коротко')
 
         async with db_pool.acquire() as conn:
             peer = await conn.fetchrow("""
                 SELECT p.id, p.first_name, p.username, p.tg_peer_id, p.in_personal,
-                       r.enabled, r.template, COALESCE(r.reply_mode, 'ai') as reply_mode,
-                       COALESCE(rc.new_contact_replies, 0) as new_replies,
-                       COALESCE(rc.daily_replies, 0) as daily_replies
+                       r.enabled, r.template, COALESCE(r.reply_mode, 'off') as reply_mode
                 FROM peers p
                 LEFT JOIN auto_reply_rules r ON r.peer_id = p.id AND r.account_id = $1
-                LEFT JOIN reply_counts rc ON rc.peer_id = p.id
                 WHERE p.id = $2
             """, ACCOUNT_ID, peer_id)
 
@@ -817,41 +869,33 @@ async def show_peer_settings(target, peer_id: int):
         username = f"@{peer['username']}" if peer['username'] else ""
         tg_id = peer['tg_peer_id']
         has_rule = peer['enabled'] or False
-        in_personal = peer['in_personal'] or False
-        prompt = peer['template'] or "Не задан"
-        reply_mode = peer['reply_mode'] if has_rule else None
-        new_replies = peer['new_replies']
-        daily_replies = peer['daily_replies']
+        reply_mode = peer['reply_mode'] if has_rule else 'off'
+        template = peer['template']
 
-        # Режим ответа - если нет правила, показываем "Выключен"
-        if has_rule:
-            mode_labels = {'ai': '🤖 AI', 'template': '📝 Шаблон', 'off': '⚫ Выкл'}
-            mode_status = mode_labels.get(reply_mode, reply_mode)
-        else:
-            mode_status = "⚪ Выключен"
+        # Режим ответа
+        mode_labels = {'ai': '🟢 AI', 'template': '🟡 Шаблон', 'off': '⚪ Выкл'}
+        mode_status = mode_labels.get(reply_mode, reply_mode)
 
-        # Статус контакта
-        if in_personal:
-            contact_status = "📍 В папке Personal"
-        else:
-            contact_status = f"👤 Новый контакт ({new_replies}/{max_new})"
+        # Кликабельная ссылка на профиль
+        name_link = f'<a href="tg://user?id={tg_id}">{name}</a>'
 
         # Формируем карточку
         text = (
-            f"<b>👤 {name}</b> {username}\n"
+            f"<b>👤 {name_link}</b> {username}\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"🆔 TG ID: <code>{tg_id}</code>\n"
-            f"{contact_status}\n\n"
+            f"🆔 <code>{tg_id}</code>\n\n"
             f"<b>Режим:</b> {mode_status}\n"
-            f"📝 Промпт: {prompt[:50]}{'...' if len(prompt) > 50 else ''}\n\n"
-            f"📊 <b>Статистика:</b>\n"
-            f"   Сегодня: {daily_replies}/{max_daily}\n"
         )
 
-        if not in_personal:
-            text += f"   Как новый: {new_replies}/{max_new}\n"
+        # Показываем промпт или шаблон в зависимости от режима
+        if reply_mode == 'ai':
+            prompt_text = template if template else f"(системный)"
+            text += f"📝 Промпт: {prompt_text[:50]}{'...' if template and len(template) > 50 else ''}\n"
+        elif reply_mode == 'template':
+            tpl_text = template if template else "Сейчас занят"
+            text += f"📝 Шаблон: {tpl_text[:50]}{'...' if template and len(template) > 50 else ''}\n"
 
-        keyboard = peer_settings_keyboard(peer_id, has_rule, in_personal, reply_mode)
+        keyboard = peer_settings_keyboard(peer_id, has_rule, False, reply_mode)
 
         # Пробуем скачать фото через Telethon
         photo_bytes = None
@@ -1039,6 +1083,45 @@ async def process_system_prompt(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {e}")
 
 
+# ==================== FSM: Ввод шаблона для контакта ====================
+
+@dp.message(PeerTemplateState.waiting_template)
+async def process_peer_template(message: Message, state: FSMContext):
+    """Обработка введённого шаблона для контакта"""
+    if not is_admin(message.from_user.id):
+        return
+
+    data = await state.get_data()
+    peer_id = data.get('peer_id')
+
+    if not peer_id:
+        await state.clear()
+        await message.answer("❌ Ошибка, попробуйте снова")
+        return
+
+    template = message.text.strip()
+
+    try:
+        async with db_pool.acquire() as conn:
+            # Обновляем шаблон
+            await conn.execute("""
+                UPDATE auto_reply_rules SET template = $3, updated_at = now()
+                WHERE account_id = $1 AND peer_id = $2
+            """, ACCOUNT_ID, peer_id, template)
+
+            peer = await conn.fetchrow("SELECT first_name, username FROM peers WHERE id = $1", peer_id)
+
+        name = peer['first_name'] if peer else str(peer_id)
+        await state.clear()
+        await message.answer(f"✅ Шаблон для {name} сохранён:\n\n📝 {template}", reply_markup=back_button())
+        logger.info(f"Template set for peer {peer_id}: {template[:30]}")
+
+    except Exception as e:
+        logger.error(f"Error saving template: {e}")
+        await state.clear()
+        await message.answer(f"❌ Ошибка: {e}")
+
+
 # ==================== CALLBACKS ====================
 
 @dp.callback_query(F.data == "menu")
@@ -1048,6 +1131,107 @@ async def cb_menu(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("🤖 Auto-Reply v3.3", reply_markup=main_menu_keyboard())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "help")
+async def cb_help(callback: CallbackQuery):
+    """Показать справку о боте"""
+    if not is_admin(callback.from_user.id):
+        return
+
+    help_text = """
+❓ <b>Auto-Reply v3.3 — Справка</b>
+
+<b>🔹 Что это?</b>
+Бот автоматически отвечает на входящие сообщения в Telegram от ваших контактов. Работает через userbot (ваш аккаунт).
+
+<b>🔹 Режимы ответа (для каждого контакта):</b>
+🟢 <b>AI</b> — ответ генерирует нейросеть (Claude или локальная модель)
+🟡 <b>Шаблон</b> — отправляется заготовленный текст
+⚪ <b>Выкл</b> — автоответ отключен
+
+<b>🔹 Главное меню:</b>
+• <b>📊 Статус</b> — статистика: сколько сообщений обработано, активные правила
+• <b>⚙️ Настройки</b> — вкл/выкл автоответ и AI, правила для новых контактов
+• <b>📋 Правила</b> — список всех активных правил автоответа
+• <b>👥 Контакты</b> — управление контактами и их режимами
+• <b>🤖 AI настройки</b> — выбор движка (Claude/Local), промпт, температура
+• <b>📇 Синхронизация</b> — загрузить контакты из папки Personal
+• <b>🔍 Поиск</b> — найти контакт по имени
+
+<b>🔹 Карточка контакта:</b>
+Нажмите на контакт в списке чтобы открыть карточку. Там можно:
+• Переключить режим (AI / Шаблон / Выкл)
+• Настроить персональный промпт для AI
+• Задать шаблон автоответа
+• Удалить контакт из правил
+
+<b>🔹 Новые контакты:</b>
+В настройках можно задать режим по умолчанию для людей, которые пишут впервые. Они автоматически добавятся в правила.
+
+<b>🔹 AI движки:</b>
+• <b>Claude</b> — Anthropic Claude API (качественнее, платно)
+• <b>Local</b> — локальная модель через Ollama (бесплатно)
+
+<b>🔹 Синхронизация Personal:</b>
+Загружает контакты из вашей папки Personal в Telegram. Удобно для массового добавления.
+
+<b>💡 Совет:</b> Начните с включения автоответа в Настройках, затем добавьте контакты через Синхронизацию или дождитесь входящих сообщений.
+"""
+
+    await callback.message.edit_text(
+        help_text.strip(),
+        parse_mode="HTML",
+        reply_markup=back_button()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "system_settings")
+async def cb_system_settings(callback: CallbackQuery):
+    """Настройки системы: автоответ, AI, новые контакты"""
+    if not is_admin(callback.from_user.id):
+        return
+
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'auto_reply_enabled'")
+            auto_on = row and row['value'] == '1'
+
+            row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'ai_enabled'")
+            ai_on = row and row['value'] == '1'
+
+        auto_icon = "🟢" if auto_on else "🔴"
+        ai_icon = "🤖" if ai_on else "🚫"
+
+        text = (
+            f"⚙️ Настройки системы\n\n"
+            f"{auto_icon} Автоответ: {'Вкл' if auto_on else 'Выкл'}\n"
+            f"{ai_icon} AI: {'Вкл' if ai_on else 'Выкл'}"
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🟢 Авто ON", callback_data="auto_on"),
+                InlineKeyboardButton(text="🔴 Авто OFF", callback_data="auto_off")
+            ],
+            [
+                InlineKeyboardButton(text="🤖 AI ON", callback_data="ai_on"),
+                InlineKeyboardButton(text="🚫 AI OFF", callback_data="ai_off")
+            ],
+            [
+                InlineKeyboardButton(text="👤 Новые контакты", callback_data="newcontact_settings")
+            ],
+            [
+                InlineKeyboardButton(text="◀️ Меню", callback_data="menu")
+            ]
+        ])
+
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        await callback.answer()
+    except Exception as e:
+        logger.error(f"Error in system_settings: {e}")
+        await callback.answer(f"Ошибка: {e}", show_alert=True)
 
 
 @dp.callback_query(F.data == "noop")
@@ -1071,30 +1255,55 @@ async def cb_stats(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "auto_on")
 async def cb_auto_on(callback: CallbackQuery):
-    if is_admin(callback.from_user.id):
-        await toggle_setting(callback, 'auto_reply_enabled', '1', "🟢 Автоответы включены")
-        await callback.answer("✅")
+    if not is_admin(callback.from_user.id):
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ('auto_reply_enabled', '1', now())
+            ON CONFLICT (key) DO UPDATE SET value = '1', updated_at = now()
+        """)
+    await callback.answer("🟢 Автоответы включены", show_alert=False)
+    # Возвращаемся в настройки системы
+    await cb_system_settings(callback)
 
 
 @dp.callback_query(F.data == "auto_off")
 async def cb_auto_off(callback: CallbackQuery):
-    if is_admin(callback.from_user.id):
-        await toggle_setting(callback, 'auto_reply_enabled', '0', "🔴 Автоответы выключены")
-        await callback.answer("✅")
+    if not is_admin(callback.from_user.id):
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ('auto_reply_enabled', '0', now())
+            ON CONFLICT (key) DO UPDATE SET value = '0', updated_at = now()
+        """)
+    await callback.answer("🔴 Автоответы выключены", show_alert=False)
+    await cb_system_settings(callback)
 
 
 @dp.callback_query(F.data == "ai_on")
 async def cb_ai_on(callback: CallbackQuery):
-    if is_admin(callback.from_user.id):
-        await toggle_setting(callback, 'ai_enabled', '1', "🤖 AI включен")
-        await callback.answer("✅")
+    if not is_admin(callback.from_user.id):
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ('ai_enabled', '1', now())
+            ON CONFLICT (key) DO UPDATE SET value = '1', updated_at = now()
+        """)
+    await callback.answer("🤖 AI включен", show_alert=False)
+    await cb_system_settings(callback)
 
 
 @dp.callback_query(F.data == "ai_off")
 async def cb_ai_off(callback: CallbackQuery):
-    if is_admin(callback.from_user.id):
-        await toggle_setting(callback, 'ai_enabled', '0', "🚫 AI выключен")
-        await callback.answer("✅")
+    if not is_admin(callback.from_user.id):
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ('ai_enabled', '0', now())
+            ON CONFLICT (key) DO UPDATE SET value = '0', updated_at = now()
+        """)
+    await callback.answer("🚫 AI выключен", show_alert=False)
+    await cb_system_settings(callback)
 
 
 @dp.callback_query(F.data == "rules")
@@ -1166,7 +1375,12 @@ async def cb_rule_off(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("mode:"))
 async def cb_mode(callback: CallbackQuery):
-    """Изменить режим ответа для контакта (ai/template/off)"""
+    """Изменить режим ответа для контакта (ai/template/off)
+
+    При включении режима:
+    - AI без промпта → использует системный промпт из settings
+    - Шаблон без текста → "Сейчас занят"
+    """
     if not is_admin(callback.from_user.id):
         return
 
@@ -1174,21 +1388,39 @@ async def cb_mode(callback: CallbackQuery):
     peer_id = int(parts[1])
     new_mode = parts[2]
 
-    mode_labels = {'ai': '🤖 AI', 'template': '📝 Шаблон', 'off': '⚫ Выкл'}
+    mode_labels = {'ai': '🟢 AI', 'template': '🟡 Шаблон', 'off': '⚪ Выкл'}
 
     try:
         async with db_pool.acquire() as conn:
-            # Создаём правило если нет, или обновляем режим
-            await conn.execute("""
-                INSERT INTO auto_reply_rules (account_id, peer_id, enabled, template, reply_mode, min_interval_sec)
-                VALUES ($1, $2, true, 'Отвечай коротко', $3, 0)
-                ON CONFLICT (account_id, peer_id) DO UPDATE SET
-                    reply_mode = $3,
-                    enabled = true,
-                    updated_at = now()
-            """, ACCOUNT_ID, peer_id, new_mode)
+            # Проверяем, есть ли уже правило
+            existing = await conn.fetchrow("""
+                SELECT template FROM auto_reply_rules
+                WHERE account_id = $1 AND peer_id = $2
+            """, ACCOUNT_ID, peer_id)
 
-        await callback.answer(f"✅ Режим: {mode_labels.get(new_mode, new_mode)}", show_alert=True)
+            if existing:
+                # Обновляем режим, сохраняя template
+                enabled = new_mode != 'off'
+                await conn.execute("""
+                    UPDATE auto_reply_rules SET
+                        reply_mode = $3,
+                        enabled = $4,
+                        updated_at = now()
+                    WHERE account_id = $1 AND peer_id = $2
+                """, ACCOUNT_ID, peer_id, new_mode, enabled)
+            else:
+                # Создаём новое правило с дефолтами
+                # AI без промпта → NULL (будет использоваться системный)
+                # Template без текста → "Сейчас занят"
+                default_template = None if new_mode == 'ai' else 'Сейчас занят'
+                enabled = new_mode != 'off'
+
+                await conn.execute("""
+                    INSERT INTO auto_reply_rules (account_id, peer_id, enabled, template, reply_mode, min_interval_sec)
+                    VALUES ($1, $2, $3, $4, $5, 0)
+                """, ACCOUNT_ID, peer_id, enabled, default_template, new_mode)
+
+        await callback.answer(f"✅ {mode_labels.get(new_mode, new_mode)}", show_alert=False)
         await show_peer_settings(callback, peer_id)
     except Exception as e:
         logger.error(f"Error setting mode: {e}")
@@ -1197,23 +1429,83 @@ async def cb_mode(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("prompt:"))
 async def cb_prompt(callback: CallbackQuery, state: FSMContext):
-    """Начать ввод промпта для контакта"""
+    """Начать ввод промпта для контакта (режим AI)"""
     if not is_admin(callback.from_user.id):
         return
 
     peer_id = int(callback.data.split(":")[1])
 
+    # Получаем текущий промпт из БД
+    current_prompt = None
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT r.template, p.first_name FROM auto_reply_rules r
+                JOIN peers p ON p.id = r.peer_id
+                WHERE r.peer_id = $1 AND r.account_id = $2
+            """, peer_id, ACCOUNT_ID)
+            if row:
+                current_prompt = row['template']
+                name = row['first_name'] or str(peer_id)
+            else:
+                name = str(peer_id)
+    except Exception as e:
+        logger.error(f"Error getting current prompt: {e}")
+        name = str(peer_id)
+
     await state.set_state(PromptState.waiting_prompt)
     await state.update_data(peer_id=peer_id)
 
-    await callback.message.edit_text(
-        "✏️ Введите промпт для этого контакта:\n\n"
-        "Примеры:\n"
-        "• Отвечай коротко и дерзко\n"
-        "• Будь вежлив и формален\n"
-        "• Отвечай с юмором\n\n"
-        "Или /start для отмены"
-    )
+    # Формируем текст с текущим промптом
+    text = f"✏️ Промпт для {name}\n\n"
+    if current_prompt:
+        text += f"📝 Текущий:\n{current_prompt}\n\n"
+    else:
+        text += "📝 Текущий: (системный)\n\n"
+    text += "Введите новый промпт:"
+
+    await callback.message.edit_text(text, reply_markup=cancel_button(f"peer:{peer_id}"))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("template:"))
+async def cb_template(callback: CallbackQuery, state: FSMContext):
+    """Начать ввод шаблона для контакта (режим Шаблон)"""
+    if not is_admin(callback.from_user.id):
+        return
+
+    peer_id = int(callback.data.split(":")[1])
+
+    # Получаем текущий шаблон из БД
+    current_template = None
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT r.template, p.first_name FROM auto_reply_rules r
+                JOIN peers p ON p.id = r.peer_id
+                WHERE r.peer_id = $1 AND r.account_id = $2
+            """, peer_id, ACCOUNT_ID)
+            if row:
+                current_template = row['template']
+                name = row['first_name'] or str(peer_id)
+            else:
+                name = str(peer_id)
+    except Exception as e:
+        logger.error(f"Error getting current template: {e}")
+        name = str(peer_id)
+
+    await state.set_state(PeerTemplateState.waiting_template)
+    await state.update_data(peer_id=peer_id)
+
+    # Формируем текст с текущим шаблоном
+    text = f"✏️ Шаблон для {name}\n\n"
+    if current_template:
+        text += f"📝 Текущий:\n{current_template}\n\n"
+    else:
+        text += "📝 Текущий: Сейчас занят\n\n"
+    text += "Введите новый шаблон:"
+
+    await callback.message.edit_text(text, reply_markup=cancel_button(f"peer:{peer_id}"))
     await callback.answer()
 
 
@@ -1289,8 +1581,10 @@ async def cb_sys_prompt(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SystemPromptState.waiting_system_prompt)
 
     await callback.message.edit_text(
-        f"📝 System Prompt\n\nТекущий:\n{prompt}\n\n"
-        f"Введите новый промпт или /start для отмены"
+        f"📝 <b>System Prompt</b>\n\n"
+        f"<b>Текущий:</b>\n{prompt}",
+        parse_mode="HTML",
+        reply_markup=cancel_button("ai_settings")
     )
     await callback.answer()
 
@@ -1416,7 +1710,7 @@ async def cb_restart_worker(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "newcontact_settings")
 async def cb_newcontact_settings(callback: CallbackQuery):
-    """Показать меню настроек новых контактов"""
+    """Показать карточку настроек новых контактов (как карточка контакта)"""
     if not is_admin(callback.from_user.id):
         return
 
@@ -1425,16 +1719,27 @@ async def cb_newcontact_settings(callback: CallbackQuery):
     template = settings['new_contact_template']
     prompt = settings['new_contact_prompt']
 
-    mode_names = {'off': '⚫ Выключено', 'template': '📝 Шаблон', 'ai': '🤖 AI'}
+    # Режим ответа
+    mode_labels = {'ai': '🟢 AI', 'template': '🟡 Шаблон', 'off': '⚪ Выкл'}
+    mode_status = mode_labels.get(mode, mode)
 
+    # Формируем карточку как у контакта
     text = (
-        f"👤 Новые контакты\n\n"
-        f"Режим: {mode_names.get(mode, mode)}\n\n"
-        f"📝 Шаблон:\n{template[:100]}...\n\n"
-        f"🤖 AI промпт:\n{prompt[:100]}..."
+        f"<b>👤 Новые контакты</b>\n"
+        f"━━━━━━━━━━━━━━━━\n"
+        f"<i>Настройка для всех новых контактов,\nкоторые пишут впервые</i>\n\n"
+        f"<b>Режим:</b> {mode_status}\n"
     )
 
-    await callback.message.edit_text(text, reply_markup=newcontact_settings_keyboard(mode))
+    # Показываем промпт или шаблон в зависимости от режима
+    if mode == 'ai':
+        prompt_text = prompt if prompt else "(системный)"
+        text += f"📝 Промпт: {prompt_text[:50]}{'...' if prompt and len(prompt) > 50 else ''}\n"
+    elif mode == 'template':
+        tpl_text = template if template else "Сейчас занят"
+        text += f"📝 Шаблон: {tpl_text[:50]}{'...' if template and len(template) > 50 else ''}\n"
+
+    await callback.message.edit_text(text, reply_markup=newcontact_settings_keyboard(mode), parse_mode="HTML")
     await callback.answer()
 
 
@@ -1453,22 +1758,11 @@ async def cb_nc_mode(callback: CallbackQuery):
             new_mode
         )
 
-    mode_names = {'off': '⚫ Выключено', 'template': '📝 Шаблон', 'ai': '🤖 AI'}
-    await callback.answer(f"✅ Режим: {mode_names.get(new_mode, new_mode)}", show_alert=True)
+    mode_labels = {'ai': '🟢 AI', 'template': '🟡 Шаблон', 'off': '⚪ Выкл'}
+    await callback.answer(f"✅ {mode_labels.get(new_mode, new_mode)}", show_alert=False)
 
-    # Обновляем меню
-    settings = await get_new_contact_settings()
-    template = settings['new_contact_template']
-    prompt = settings['new_contact_prompt']
-
-    text = (
-        f"👤 Новые контакты\n\n"
-        f"Режим: {mode_names.get(new_mode, new_mode)}\n\n"
-        f"📝 Шаблон:\n{template[:100]}...\n\n"
-        f"🤖 AI промпт:\n{prompt[:100]}..."
-    )
-
-    await callback.message.edit_text(text, reply_markup=newcontact_settings_keyboard(new_mode))
+    # Обновляем карточку
+    await cb_newcontact_settings(callback)
 
 
 @dp.callback_query(F.data == "nc_template")
@@ -1481,9 +1775,10 @@ async def cb_nc_template(callback: CallbackQuery, state: FSMContext):
     current = settings['new_contact_template']
 
     await callback.message.edit_text(
-        f"✏️ Введите новый шаблон для новых контактов:\n\n"
-        f"Текущий:\n{current}\n\n"
-        f"Отправьте новый текст или /cancel для отмены"
+        f"✏️ <b>Введите новый шаблон для новых контактов:</b>\n\n"
+        f"<b>Текущий:</b>\n{current}",
+        parse_mode="HTML",
+        reply_markup=cancel_button("newcontact_settings")
     )
     await state.set_state(NewContactState.waiting_template)
     await callback.answer()
@@ -1499,9 +1794,10 @@ async def cb_nc_prompt(callback: CallbackQuery, state: FSMContext):
     current = settings['new_contact_prompt']
 
     await callback.message.edit_text(
-        f"📝 Введите новый AI промпт для новых контактов:\n\n"
-        f"Текущий:\n{current}\n\n"
-        f"Отправьте новый текст или /cancel для отмены"
+        f"📝 <b>Введите новый AI промпт для новых контактов:</b>\n\n"
+        f"<b>Текущий:</b>\n{current}",
+        parse_mode="HTML",
+        reply_markup=cancel_button("newcontact_settings")
     )
     await state.set_state(NewContactState.waiting_prompt)
     await callback.answer()

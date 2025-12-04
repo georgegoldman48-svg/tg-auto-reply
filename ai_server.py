@@ -2,8 +2,8 @@
 """
 AI Server для Telegram Auto-Reply
 
-Загружает SambaLingo-Russian-Chat + LoRA адаптер Егора
-и отвечает на запросы от worker на VPS3.
+Использует обученную модель egor:latest через Ollama API.
+FastAPI сервер с endpoints /health и /generate.
 
 Запуск:
     python ai_server.py
@@ -14,301 +14,235 @@ AI Server для Telegram Auto-Reply
 Endpoints:
     GET  /health   - проверка статуса
     POST /generate - генерация ответа
+    GET  /settings - текущие настройки
+    POST /settings - обновить настройки
 """
 
-import json
+import asyncio
 import logging
-import random
-import re
-import torch
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from typing import List, Dict, Any, Optional
+import os
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+
+# Отключаем прокси для localhost
+os.environ.pop('HTTP_PROXY', None)
+os.environ.pop('HTTPS_PROXY', None)
+os.environ.pop('http_proxy', None)
+os.environ.pop('https_proxy', None)
+os.environ.pop('ALL_PROXY', None)
+os.environ.pop('all_proxy', None)
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+app = FastAPI(title="Egor AI Server", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Конфигурация
-HOST = "0.0.0.0"
-PORT = 8080
-LORA_PATH = "/home/george/sambalingo-egor"
-MAX_SEQ_LENGTH = 512
-DEFAULT_SYSTEM_PROMPT = "Ты Егор. Отвечаешь коротко, живо, по делу. Без воды и официоза."
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_MAX_TOKENS = 100
+OLLAMA_URL = "http://localhost:11434"
+MODEL_NAME = "egor:latest"
 
 # Глобальные настройки (можно менять через /settings)
 current_settings = {
-    "system_prompt": DEFAULT_SYSTEM_PROMPT,
-    "temperature": DEFAULT_TEMPERATURE,
-    "max_tokens": DEFAULT_MAX_TOKENS
+    "system_prompt": "Ты Жора (Егор). Отвечай коротко, живо, неформально.",
+    "temperature": 0.7,
+    "max_tokens": 100
 }
 
-# Fallback ответы для слишком коротких генераций
-FALLBACK_RESPONSES = ["ага", "ок", "понял", "да", "ну да", "угу"]
 
-# Специальные токены для очистки
-SPECIAL_TOKENS = ["<|im_end|>", "<|im_start|>", "</s>", "<s>", "<|endoftext|>"]
-
-# Глобальные переменные для модели
-model = None
-tokenizer = None
-
-
-def load_model():
-    """Загрузка модели с LoRA адаптером"""
-    global model, tokenizer
-
-    from unsloth import FastLanguageModel
-
-    logger.info("=" * 60)
-    logger.info("Загрузка SambaLingo + LoRA адаптер...")
-    logger.info(f"LoRA path: {LORA_PATH}")
-    logger.info("=" * 60)
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=LORA_PATH,
-        max_seq_length=MAX_SEQ_LENGTH,
-        dtype=None,
-        load_in_4bit=True,
-    )
-
-    FastLanguageModel.for_inference(model)
-
-    # Информация о GPU
-    if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        logger.info(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
-
-    logger.info("Модель загружена!")
-
-
-def generate_response(
-    prompt: str,
-    history: Optional[List[Dict[str, Any]]] = None,
-    max_new_tokens: Optional[int] = None,
-    temperature: Optional[float] = None,
-    system_prompt: Optional[str] = None,
+class GenerateRequest(BaseModel):
+    prompt: str
+    history: Optional[List[Dict[str, Any]]] = None
+    peer_id: Optional[int] = 0
     peer_prompt: Optional[str] = None
-) -> str:
-    """
-    Генерация ответа с учётом истории диалога.
+    system_prompt: Optional[str] = None
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
 
-    Args:
-        prompt: Текущее сообщение пользователя
-        history: История диалога [{"role": "user/assistant", "content": "..."}]
-        max_new_tokens: Максимум токенов в ответе (из глобальных настроек если None)
-        temperature: Температура генерации (из глобальных настроек если None)
-        system_prompt: System prompt (из глобальных настроек если None)
-        peer_prompt: Дополнительный промпт для конкретного пира из Telegram бота
 
-    Returns:
-        Сгенерированный ответ
-    """
-    # Берём значения из глобальных настроек если не переданы
-    if max_new_tokens is None:
-        max_new_tokens = current_settings["max_tokens"]
-    if temperature is None:
-        temperature = current_settings["temperature"]
-    if system_prompt is None:
-        system_prompt = current_settings["system_prompt"]
+class GenerateResponse(BaseModel):
+    response: str
+    model: Optional[str] = None
+    tokens_used: Optional[int] = None
 
-    # Комбинируем глобальный промпт + промпт для пира
-    if peer_prompt:
-        system_prompt = f"{system_prompt}\n\nДополнительно: {peer_prompt}"
 
-    # Формируем контекст с историей
-    messages = []
+class HealthResponse(BaseModel):
+    status: str
+    model: str
+    ollama_status: str
+    ready: bool
 
-    # Добавляем историю (последние сообщения)
-    if history:
-        # Берём последние N сообщений чтобы не превысить контекст
-        recent_history = history[-10:]  # Последние 10 сообщений
-        messages.extend(recent_history)
 
-    # Добавляем текущий вопрос
-    messages.append({"role": "user", "content": prompt})
+class SettingsRequest(BaseModel):
+    system_prompt: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
 
-    # Формируем промпт в ChatML формате
-    input_text = f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
 
-    for msg in messages:
-        role = msg["role"]
-        content = msg["content"]
-        input_text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Проверка здоровья сервера и модели"""
+    try:
+        # proxy=None чтобы не использовать системные прокси для localhost
+        async with httpx.AsyncClient(timeout=10.0, proxy=None) as client:
+            resp = await client.get(f"{OLLAMA_URL}/api/tags")
+            if resp.status_code != 200:
+                return HealthResponse(
+                    status="degraded",
+                    model=MODEL_NAME,
+                    ollama_status="unavailable",
+                    ready=False
+                )
 
-    input_text += "<|im_start|>assistant\n"
+            models = resp.json().get("models", [])
+            model_found = any(m.get("name") == MODEL_NAME for m in models)
 
-    # Токенизация
-    inputs = tokenizer(input_text, return_tensors="pt").to("cuda")
+            if not model_found:
+                return HealthResponse(
+                    status="degraded",
+                    model=MODEL_NAME,
+                    ollama_status=f"model {MODEL_NAME} not found",
+                    ready=False
+                )
 
-    # Генерация
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-            repetition_penalty=1.1,
+            return HealthResponse(
+                status="healthy",
+                model=MODEL_NAME,
+                ollama_status="connected",
+                ready=True
+            )
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return HealthResponse(
+            status="unhealthy",
+            model=MODEL_NAME,
+            ollama_status=f"error: {str(e)}",
+            ready=False
         )
 
-    # Декодирование
-    response = tokenizer.decode(outputs[0], skip_special_tokens=False)
 
-    # Извлекаем только ответ ассистента
-    if "<|im_start|>assistant" in response:
-        answer = response.split("<|im_start|>assistant")[-1]
-        answer = answer.split("<|im_end|>")[0].strip()
-    else:
-        answer = response
-
-    # Обрезаем всё после первого <| (специальные токены)
-    if '<|' in answer:
-        answer = answer.split('<|')[0]
-
-    # Убираем </s> и другие токены
-    answer = answer.replace('</s>', '').replace('<s>', '')
-
-    # Убираем возможные артефакты
-    answer = answer.rstrip('<').strip()
-    if answer.startswith("\n"):
-        answer = answer[1:]
-
-    # Fallback для слишком коротких ответов
-    if len(answer) < 2:
-        answer = random.choice(FALLBACK_RESPONSES)
-        logger.info(f"Короткий ответ, используем fallback: {answer}")
-
-    return answer
+@app.get("/settings")
+async def get_settings():
+    """Получить текущие настройки"""
+    return current_settings
 
 
-class AIRequestHandler(BaseHTTPRequestHandler):
-    """HTTP обработчик запросов"""
+@app.post("/settings")
+async def update_settings(request: SettingsRequest):
+    """Обновить настройки"""
+    if request.system_prompt is not None:
+        current_settings["system_prompt"] = request.system_prompt
+    if request.temperature is not None:
+        current_settings["temperature"] = request.temperature
+    if request.max_tokens is not None:
+        current_settings["max_tokens"] = request.max_tokens
 
-    def log_message(self, format, *args):
-        """Переопределяем логирование"""
-        logger.info(f"{self.address_string()} - {args[0]}")
+    logger.info(f"Settings updated: temp={current_settings['temperature']}, "
+                f"max={current_settings['max_tokens']}, "
+                f"prompt={current_settings['system_prompt'][:30]}...")
 
-    def send_json_response(self, data: dict, status: int = 200):
-        """Отправка JSON ответа"""
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
-
-    def do_GET(self):
-        """Обработка GET запросов"""
-        if self.path == "/health":
-            gpu_name = "N/A"
-            if torch.cuda.is_available():
-                gpu_name = torch.cuda.get_device_name(0)
-
-            self.send_json_response({
-                "status": "ok",
-                "model": "SambaLingo-Russian-Chat + LoRA (Egor)",
-                "gpu": gpu_name,
-                "ready": model is not None
-            })
-        elif self.path == "/settings":
-            self.send_json_response(current_settings)
-        else:
-            self.send_json_response({"error": "Not found"}, 404)
-
-    def do_POST(self):
-        """Обработка POST запросов"""
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length).decode("utf-8")
-
-        if self.path == "/generate":
-            try:
-                data = json.loads(body)
-
-                prompt = data.get("prompt", "")
-                history = data.get("history", [])
-                peer_id = data.get("peer_id", 0)
-                peer_prompt = data.get("peer_prompt")  # Промпт для пира из Telegram
-
-                if not prompt:
-                    self.send_json_response({"error": "prompt is required"}, 400)
-                    return
-
-                log_extra = f"peer_prompt={peer_prompt[:20]}..." if peer_prompt else ""
-                logger.info(f"[peer:{peer_id}] Q: {prompt[:50]}... (temp={current_settings['temperature']}, max={current_settings['max_tokens']}) {log_extra}")
-
-                # Генерируем ответ с глобальными настройками + промпт для пира
-                response = generate_response(prompt, history, peer_prompt=peer_prompt)
-
-                logger.info(f"[peer:{peer_id}] A: {response[:50]}...")
-
-                self.send_json_response({"response": response})
-
-            except json.JSONDecodeError:
-                self.send_json_response({"error": "Invalid JSON"}, 400)
-            except Exception as e:
-                logger.error(f"Generation error: {e}")
-                self.send_json_response({"error": str(e)}, 500)
-
-        elif self.path == "/settings":
-            try:
-                data = json.loads(body)
-
-                # Обновляем глобальные настройки
-                if "system_prompt" in data:
-                    current_settings["system_prompt"] = data["system_prompt"]
-                if "temperature" in data:
-                    current_settings["temperature"] = float(data["temperature"])
-                if "max_tokens" in data:
-                    current_settings["max_tokens"] = int(data["max_tokens"])
-
-                logger.info(f"Settings updated: temp={current_settings['temperature']}, max={current_settings['max_tokens']}, prompt={current_settings['system_prompt'][:30]}...")
-
-                self.send_json_response({"status": "ok", "settings": current_settings})
-
-            except json.JSONDecodeError:
-                self.send_json_response({"error": "Invalid JSON"}, 400)
-            except Exception as e:
-                self.send_json_response({"error": str(e)}, 500)
-        else:
-            self.send_json_response({"error": "Not found"}, 404)
+    return {"status": "ok", "settings": current_settings}
 
 
-def main():
-    """Запуск сервера"""
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest):
+    """Генерация ответа с помощью модели"""
+    peer_id = request.peer_id or 0
+    logger.info(f"[peer:{peer_id}] Q: {request.prompt[:50]}...")
+
+    # Берём настройки из запроса или из глобальных
+    system_prompt = request.system_prompt or current_settings["system_prompt"]
+    temperature = request.temperature or current_settings["temperature"]
+    max_tokens = request.max_tokens or current_settings["max_tokens"]
+
+    # Добавляем peer_prompt если есть
+    if request.peer_prompt:
+        system_prompt = f"{system_prompt}\n\nДополнительно: {request.peer_prompt}"
+
+    try:
+        # proxy=None чтобы не использовать системные прокси для localhost
+        async with httpx.AsyncClient(timeout=60.0, proxy=None) as client:
+            payload = {
+                "model": MODEL_NAME,
+                "prompt": request.prompt,
+                "system": system_prompt,
+                "stream": False,
+                "options": {
+                    "num_predict": max_tokens,
+                    "temperature": temperature,
+                    "stop": ["<|im_start|>", "<|im_end|>", "\n\n"]
+                }
+            }
+
+            resp = await client.post(
+                f"{OLLAMA_URL}/api/generate",
+                json=payload
+            )
+
+            if resp.status_code != 200:
+                logger.error(f"Ollama error: {resp.status_code} - {resp.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Ollama API error: {resp.status_code}"
+                )
+
+            data = resp.json()
+            response_text = data.get("response", "").strip()
+
+            # Убираем возможные артефакты
+            if "<|" in response_text:
+                response_text = response_text.split("<|")[0].strip()
+            response_text = response_text.replace("</s>", "").replace("<s>", "").strip()
+
+            logger.info(f"[peer:{peer_id}] A: {response_text[:50]}...")
+
+            return GenerateResponse(
+                response=response_text,
+                model=MODEL_NAME,
+                tokens_used=data.get("eval_count")
+            )
+
+    except httpx.TimeoutException:
+        logger.error("Ollama timeout")
+        raise HTTPException(status_code=504, detail="Generation timeout")
+    except Exception as e:
+        logger.error(f"Generate error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/")
+async def root():
+    """Информация о сервере"""
+    return {
+        "name": "Egor AI Server",
+        "version": "2.0.0",
+        "model": MODEL_NAME,
+        "endpoints": ["/health", "/generate", "/settings"]
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
     logger.info("=" * 60)
     logger.info("AI Server для Telegram Auto-Reply")
+    logger.info(f"Model: {MODEL_NAME}")
     logger.info("=" * 60)
-
-    # Загружаем модель
-    load_model()
-
-    # Запускаем HTTP сервер
-    server = HTTPServer((HOST, PORT), AIRequestHandler)
-
-    logger.info("=" * 60)
-    logger.info(f"Сервер запущен: http://{HOST}:{PORT}")
-    logger.info("")
-    logger.info("Endpoints:")
-    logger.info(f"  GET  http://localhost:{PORT}/health")
-    logger.info(f"  POST http://localhost:{PORT}/generate")
     logger.info("")
     logger.info("Для подключения к VPS3 запустите:")
     logger.info("  ssh -N -R 8080:localhost:8080 root@188.116.27.68")
     logger.info("")
-    logger.info("Нажмите Ctrl+C для остановки")
-    logger.info("=" * 60)
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("\nОстановка сервера...")
-        server.shutdown()
-        logger.info("Сервер остановлен")
-
-
-if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=8080)
