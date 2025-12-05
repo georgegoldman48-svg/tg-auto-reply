@@ -1,5 +1,5 @@
 """
-Admin Bot v3.3
+Admin Bot v3.5
 
 Telegram-бот для управления автоответчиком с AI.
 Настройка промпта и режима (AI/Template/Off) для каждого контакта.
@@ -87,6 +87,17 @@ class PeerTemplateState(StatesGroup):
     waiting_template = State()
 
 
+class ChatSettingsState(StatesGroup):
+    waiting_keywords = State()
+    waiting_interval = State()
+    waiting_cooldown = State()
+    waiting_limit = State()
+
+
+class AddChatState(StatesGroup):
+    waiting_chat_id = State()
+
+
 async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5, command_timeout=60)
@@ -112,6 +123,9 @@ def main_menu_keyboard():
         [
             InlineKeyboardButton(text="📋 Правила", callback_data="rules"),
             InlineKeyboardButton(text="👥 Контакты", callback_data="peers:0")
+        ],
+        [
+            InlineKeyboardButton(text="💬 Чаты", callback_data="chats:0")
         ],
         [
             InlineKeyboardButton(text="🤖 AI настройки", callback_data="ai_settings")
@@ -240,6 +254,7 @@ def peer_settings_keyboard(peer_id: int, has_rule: bool, in_personal: bool = Fal
         ])
 
     keyboard.append([InlineKeyboardButton(text="◀️ Назад", callback_data="peers:0")])
+    keyboard.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete:{peer_id}")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
@@ -360,6 +375,246 @@ async def set_ai_setting(key: str, value: str):
 
 
 
+
+
+
+async def get_or_create_peer(tg_id: int, username: str = None, first_name: str = None, peer_type: str = 'user'):
+    """Создать или обновить peer по tg_id из пересланного сообщения
+
+    Args:
+        tg_id: Telegram ID пользователя или чата
+        username: @username
+        first_name: Имя (или название чата)
+        peer_type: 'user' или 'chat'
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO peers (tg_peer_id, username, first_name, peer_type, is_deleted)
+            VALUES ($1, $2, $3, $4, false)
+            ON CONFLICT (tg_peer_id) DO UPDATE SET
+                username = COALESCE(EXCLUDED.username, peers.username),
+                first_name = COALESCE(EXCLUDED.first_name, peers.first_name),
+                peer_type = EXCLUDED.peer_type,
+                is_deleted = false,
+                updated_at = now()
+            RETURNING id, (xmax = 0) as is_new
+        """, tg_id, username, first_name, peer_type)
+        return row["id"], row["is_new"]
+
+
+# ==================== CHATS FUNCTIONS ====================
+
+def chats_keyboard(chats: list, offset: int, total: int):
+    """Клавиатура со списком чатов с индикаторами
+
+    Индикаторы:
+    - 🟢 — есть активные триггеры
+    - ⚪ — триггеры отключены
+    """
+    keyboard = []
+
+    for i in range(0, len(chats), 2):
+        row = []
+        for j in range(2):
+            if i + j < len(chats):
+                c = chats[i + j]
+                name = c['first_name'] or "—"
+                has_triggers = c.get('has_triggers', False)
+
+                icon = "🟢" if has_triggers else "⚪"
+                display_name = name[:18]
+                btn_text = f"{icon} {display_name}"[:22]
+
+                row.append(InlineKeyboardButton(text=btn_text, callback_data=f"chat:{c['id']}"))
+        if row:
+            keyboard.append(row)
+
+    # Навигация
+    page = offset // PEERS_PER_PAGE + 1
+    total_pages = max(1, (total + PEERS_PER_PAGE - 1) // PEERS_PER_PAGE)
+
+    nav_row = []
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"chats:{offset - PEERS_PER_PAGE}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text="◁", callback_data="noop"))
+
+    nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="noop"))
+
+    if offset + PEERS_PER_PAGE < total:
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"chats:{offset + PEERS_PER_PAGE}"))
+    else:
+        nav_row.append(InlineKeyboardButton(text="▷", callback_data="noop"))
+
+    keyboard.append(nav_row)
+    keyboard.append([
+        InlineKeyboardButton(text="➕ Добавить", callback_data="add_chat"),
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"chats:{offset}")
+    ])
+    keyboard.append([
+        InlineKeyboardButton(text="◀️ Меню", callback_data="menu")
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def show_chats(target, offset: int = 0):
+    """Показать список чатов"""
+    try:
+        async with db_pool.acquire() as conn:
+            total = await conn.fetchval("""
+                SELECT COUNT(*) FROM peers
+                WHERE peer_type = 'chat' AND (is_deleted IS NULL OR is_deleted = false)
+            """)
+
+            rows = await conn.fetch("""
+                SELECT
+                    p.id, p.tg_peer_id, p.username, p.first_name,
+                    EXISTS(SELECT 1 FROM chat_triggers ct WHERE ct.peer_id = p.id AND ct.enabled = true) as has_triggers
+                FROM peers p
+                WHERE p.peer_type = 'chat' AND (is_deleted IS NULL OR is_deleted = false)
+                ORDER BY p.updated_at DESC
+                LIMIT $1 OFFSET $2
+            """, PEERS_PER_PAGE, offset)
+
+        chats = [dict(r) for r in rows]
+        text = (
+            f"💬 Чаты ({total})\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🟢 Активен | ⚪ Неактивен"
+        )
+
+        if isinstance(target, CallbackQuery):
+            await target.message.edit_text(text, reply_markup=chats_keyboard(chats, offset, total))
+        else:
+            await target.answer(text, reply_markup=chats_keyboard(chats, offset, total))
+    except Exception as e:
+        logger.error(f"Error in show_chats: {e}")
+
+
+def chat_settings_keyboard(peer_id: int, triggers: dict):
+    """Клавиатура настроек чата"""
+    mention_icon = "✅" if triggers.get('trigger_mention') else "⬜"
+    reply_icon = "✅" if triggers.get('trigger_reply') else "⬜"
+    keywords_icon = "✅" if triggers.get('trigger_keywords') else "⬜"
+    random_icon = "✅" if triggers.get('trigger_random') else "⬜"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(text=f"{mention_icon} @упоминание", callback_data=f"ct_mention:{peer_id}"),
+            InlineKeyboardButton(text=f"{reply_icon} Reply", callback_data=f"ct_reply:{peer_id}")
+        ],
+        [
+            InlineKeyboardButton(text=f"{keywords_icon} Слова", callback_data=f"ct_keywords:{peer_id}"),
+            InlineKeyboardButton(text=f"{random_icon} Рандом", callback_data=f"ct_random:{peer_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🔑 Задать слова", callback_data=f"ct_set_keywords:{peer_id}"),
+            InlineKeyboardButton(text="⏱ Интервал", callback_data=f"ct_set_interval:{peer_id}")
+        ],
+        [
+            InlineKeyboardButton(text="⏳ Кулдаун", callback_data=f"ct_set_cooldown:{peer_id}"),
+            InlineKeyboardButton(text="📊 Лимит", callback_data=f"ct_set_limit:{peer_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_chat:{peer_id}"),
+            InlineKeyboardButton(text="◀️ Назад", callback_data="chats:0")
+        ]
+    ]
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def show_chat_settings(target, peer_id: int):
+    """Показать карточку настроек чата"""
+    try:
+        async with db_pool.acquire() as conn:
+            peer = await conn.fetchrow("""
+                SELECT p.id, p.first_name, p.username, p.tg_peer_id
+                FROM peers p
+                WHERE p.id = $1
+            """, peer_id)
+
+            if not peer:
+                if isinstance(target, CallbackQuery):
+                    await target.answer("Чат не найден", show_alert=True)
+                return
+
+            # Получаем или создаём триггеры
+            triggers = await conn.fetchrow("""
+                SELECT * FROM chat_triggers WHERE peer_id = $1
+            """, peer_id)
+
+            if not triggers:
+                # Создаём дефолтные триггеры
+                await conn.execute("""
+                    INSERT INTO chat_triggers (peer_id) VALUES ($1)
+                    ON CONFLICT (account_id, peer_id) DO NOTHING
+                """, peer_id)
+                triggers = await conn.fetchrow("""
+                    SELECT * FROM chat_triggers WHERE peer_id = $1
+                """, peer_id)
+
+        name = peer['first_name'] or "—"
+        tg_id = peer['tg_peer_id']
+        username = peer['username']
+
+        # Формируем ссылку
+        if username:
+            name_link = f'<a href="https://t.me/{username}">{name}</a>'
+        else:
+            name_link = name
+
+        # Индикаторы триггеров
+        mention_check = "✅" if triggers['trigger_mention'] else "⬜"
+        reply_check = "✅" if triggers['trigger_reply'] else "⬜"
+        keywords_check = "✅" if triggers['trigger_keywords'] else "⬜"
+        random_check = "✅" if triggers['trigger_random'] else "⬜"
+
+        # Ключевые слова
+        keywords = triggers['keywords'] or "не заданы"
+        if len(keywords) > 30:
+            keywords = keywords[:30] + "..."
+
+        # Интервал рандома
+        rand_min = triggers['random_interval_min'] or 60
+        rand_max = triggers['random_interval_max'] or 180
+
+        text = (
+            f"💬 <b>{name_link}</b>\n"
+            f"━━━━━━━━━━━━━━━━\n"
+            f"🆔 <code>{tg_id}</code>\n\n"
+            f"<b>Триггеры:</b>\n"
+            f"{mention_check} @упоминание\n"
+            f"{reply_check} reply на меня\n"
+            f"{keywords_check} ключевые слова: {keywords}\n"
+            f"{random_check} рандом: {rand_min}-{rand_max} мин\n\n"
+            f"⏳ Кулдаун: {triggers['cooldown_sec']} сек\n"
+            f"📊 Лимит: {triggers['daily_count']}/{triggers['daily_limit']} в день"
+        )
+
+        keyboard = chat_settings_keyboard(peer_id, dict(triggers))
+
+        if isinstance(target, CallbackQuery):
+            try:
+                await target.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+            except:
+                await target.message.delete()
+                await bot.send_message(
+                    chat_id=target.message.chat.id,
+                    text=text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+        else:
+            await target.answer(text, reply_markup=keyboard, parse_mode="HTML")
+
+    except Exception as e:
+        logger.error(f"Error in show_chat_settings: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 # ==================== HANDLERS ====================
 
 @dp.message(CommandStart())
@@ -368,7 +623,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await message.answer("⛔ Доступ запрещён.")
         return
     await state.clear()
-    await message.answer("🤖 Auto-Reply v3.0", reply_markup=main_menu_keyboard())
+    await message.answer("🤖 Auto-Reply v3.4\n\n💡 Перешли сообщение чтобы добавить контакт", reply_markup=main_menu_keyboard())
 
 
 @dp.message(Command("help"))
@@ -645,7 +900,7 @@ async def show_status(target):
             ai_on = row and row['value'] == '1'
 
             rules = await conn.fetchval("SELECT COUNT(*) FROM auto_reply_rules WHERE account_id = $1 AND enabled = true", ACCOUNT_ID)
-            peers = await conn.fetchval("SELECT COUNT(*) FROM peers WHERE is_bot = false")
+            peers = await conn.fetchval("SELECT COUNT(*) FROM peers WHERE is_bot = false AND (is_deleted IS NULL OR is_deleted = false)")
             msgs = await conn.fetchval("SELECT COUNT(*) FROM messages")
 
             # Статистика за сегодня
@@ -803,7 +1058,7 @@ async def show_peers(target, offset: int = 0):
         max_new = limits['new_contact_max_replies']
 
         async with db_pool.acquire() as conn:
-            total = await conn.fetchval("SELECT COUNT(*) FROM peers WHERE is_bot = false")
+            total = await conn.fetchval("SELECT COUNT(*) FROM peers WHERE is_bot = false AND (is_deleted IS NULL OR is_deleted = false)")
 
             rows = await conn.fetch("""
                 SELECT
@@ -812,7 +1067,7 @@ async def show_peers(target, offset: int = 0):
                     r.reply_mode
                 FROM peers p
                 LEFT JOIN auto_reply_rules r ON r.peer_id = p.id AND r.account_id = $1
-                WHERE p.is_bot = false
+                WHERE p.is_bot = false AND (is_deleted IS NULL OR is_deleted = false)
                 ORDER BY p.updated_at DESC
                 LIMIT $2 OFFSET $3
             """, ACCOUNT_ID, PEERS_PER_PAGE, offset)
@@ -854,11 +1109,20 @@ async def show_peer_settings(target, peer_id: int):
         async with db_pool.acquire() as conn:
             peer = await conn.fetchrow("""
                 SELECT p.id, p.first_name, p.username, p.tg_peer_id, p.in_personal,
-                       r.enabled, r.template, COALESCE(r.reply_mode, 'off') as reply_mode
+                       r.enabled, r.template, COALESCE(r.reply_mode, 'off') as reply_mode,
+                       COALESCE(rc.daily_replies, 0) as daily_replies,
+                       COALESCE(rc.new_contact_replies, 0) as new_contact_replies
                 FROM peers p
                 LEFT JOIN auto_reply_rules r ON r.peer_id = p.id AND r.account_id = $1
+                LEFT JOIN reply_counts rc ON rc.peer_id = p.id
                 WHERE p.id = $2
             """, ACCOUNT_ID, peer_id)
+            
+            # Get daily limit from settings
+            daily_limit_row = await conn.fetchrow(
+                "SELECT value FROM settings WHERE key = 'daily_max_replies'"
+            )
+            daily_limit = int(daily_limit_row['value']) if daily_limit_row else 50
 
         if not peer:
             if isinstance(target, CallbackQuery):
@@ -879,12 +1143,17 @@ async def show_peer_settings(target, peer_id: int):
         # Кликабельная ссылка на профиль
         name_link = f'<a href="tg://user?id={tg_id}">{name}</a>'
 
+        # Get counts
+        daily_replies = peer['daily_replies'] if 'daily_replies' in peer.keys() else 0
+        
         # Формируем карточку
         text = (
             f"<b>👤 {name_link}</b> {username}\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"🆔 <code>{tg_id}</code>\n\n"
             f"<b>Режим:</b> {mode_status}\n"
+            f"📊 Лимит: {daily_limit}/день\n"
+            f"✉️ Отправлено: {daily_replies} сегодня\n"
         )
 
         # Показываем промпт или шаблон в зависимости от режима
@@ -968,7 +1237,7 @@ async def cmd_find(message: Message):
                     p.id, p.tg_peer_id, p.username, p.first_name,
                     EXISTS(SELECT 1 FROM auto_reply_rules WHERE peer_id = p.id AND account_id = $1 AND enabled = true) as has_rule
                 FROM peers p
-                WHERE p.is_bot = false AND (
+                WHERE p.is_bot = false AND (is_deleted IS NULL OR is_deleted = false) AND (
                     p.username ILIKE $2 OR
                     p.first_name ILIKE $2 OR
                     CAST(p.tg_peer_id AS TEXT) = $3
@@ -1849,6 +2118,674 @@ async def process_nc_prompt(message: Message, state: FSMContext):
 
     await state.clear()
     await message.answer(f"✅ AI промпт обновлён:\n\n{new_prompt}", reply_markup=back_button())
+
+
+
+
+
+# ==================== CHAT CALLBACKS ====================
+
+@dp.callback_query(F.data.startswith("chats:"))
+async def cb_chats(callback: CallbackQuery):
+    """Показать список чатов"""
+    if is_admin(callback.from_user.id):
+        offset = int(callback.data.split(":")[1])
+        await show_chats(callback, offset)
+        await callback.answer()
+
+
+@dp.callback_query(F.data == "add_chat")
+async def cb_add_chat(callback: CallbackQuery, state: FSMContext):
+    """Показать инструкцию по добавлению чата"""
+    if not is_admin(callback.from_user.id):
+        return
+
+    text = (
+        "➕ <b>Добавление чата</b>\n"
+        "━━━━━━━━━━━━━━━━\n\n"
+        "<b>Способ 1: Переслать сообщение</b>\n"
+        "Перешлите любое сообщение из нужного чата сюда.\n"
+        "⚠️ Работает только для публичных чатов.\n\n"
+        "<b>Способ 2: Ввести ID вручную</b>\n"
+        "Нажмите кнопку ниже и введите ID чата.\n\n"
+        "💡 <b>Как узнать ID чата:</b>\n"
+        "1. Добавьте бота @getmyid_bot в чат\n"
+        "2. Он покажет ID (начинается с -100...)\n"
+        "3. Скопируйте ID и введите сюда"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Ввести ID вручную", callback_data="add_chat_manual")],
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="chats:0")]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "add_chat_manual")
+async def cb_add_chat_manual(callback: CallbackQuery, state: FSMContext):
+    """Начать ввод ID чата вручную"""
+    if not is_admin(callback.from_user.id):
+        return
+
+    await state.set_state(AddChatState.waiting_chat_id)
+
+    text = (
+        "✏️ <b>Введите ID и название чата:</b>\n\n"
+        "Формат: <code>ID Название</code>\n\n"
+        "Пример:\n"
+        "<code>4851252870 Мой рабочий чат</code>\n\n"
+        "💡 ID из @getmyid_bot (без -100)"
+    )
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="chats:0")]
+        ]),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message(AddChatState.waiting_chat_id)
+async def handle_add_chat_id(message: Message, state: FSMContext):
+    """Обработка ввода ID чата"""
+    if not is_admin(message.from_user.id):
+        return
+
+    text = message.text.strip()
+
+    # Проверка на отмену
+    if text.lower() in ['отмена', 'cancel', '/cancel']:
+        await state.clear()
+        await message.answer("❌ Отменено", reply_markup=back_button())
+        return
+
+    # Парсим ID и название
+    parts = text.split(maxsplit=1)
+    if not parts:
+        await message.answer(
+            "❌ Введите ID чата\n\nПример: <code>-1001234567890 Мой чат</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        chat_id = int(parts[0])
+    except ValueError:
+        await message.answer(
+            "❌ ID должен быть числом\n\nПример: <code>4851252870 Мой чат</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Конвертируем в формат Telethon (без -100 префикса)
+    # Принимаем оба формата: -1001234567890 или 1234567890
+    if chat_id < 0:
+        # Убираем -100 префикс: -1001234567890 -> 1234567890
+        chat_id_str = str(chat_id)
+        if chat_id_str.startswith("-100"):
+            chat_id = int(chat_id_str[4:])
+        else:
+            chat_id = abs(chat_id)
+
+    chat_title = parts[1] if len(parts) > 1 else f"Chat {chat_id}"
+
+    # Добавляем чат
+    peer_id, is_new = await get_or_create_peer(
+        chat_id,
+        None,
+        chat_title,
+        peer_type='chat'
+    )
+
+    await state.clear()
+
+    if is_new:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO chat_triggers (peer_id, account_id) VALUES ($1, 1)
+                ON CONFLICT (account_id, peer_id) DO NOTHING
+            """, peer_id)
+
+        await message.answer(
+            f"✅ Чат добавлен!\n\n"
+            f"<b>{chat_title}</b>\n"
+            f"ID: <code>{chat_id}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"chat:{peer_id}")],
+                [InlineKeyboardButton(text="◀️ К чатам", callback_data="chats:0")]
+            ]),
+            parse_mode="HTML"
+        )
+    else:
+        await message.answer(
+            f"ℹ️ Чат уже в базе\n\n"
+            f"<b>{chat_title}</b>\n"
+            f"ID: <code>{chat_id}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Открыть", callback_data=f"chat:{peer_id}")],
+                [InlineKeyboardButton(text="◀️ К чатам", callback_data="chats:0")]
+            ]),
+            parse_mode="HTML"
+        )
+
+
+@dp.callback_query(F.data.startswith("chat:"))
+async def cb_chat(callback: CallbackQuery):
+    """Открыть настройки чата"""
+    if is_admin(callback.from_user.id):
+        peer_id = int(callback.data.split(":")[1])
+        await show_chat_settings(callback, peer_id)
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ct_mention:"))
+async def cb_ct_mention(callback: CallbackQuery):
+    """Toggle trigger_mention"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE chat_triggers SET trigger_mention = NOT trigger_mention, updated_at = now()
+            WHERE peer_id = $1
+        """, peer_id)
+    await callback.answer("✅ Обновлено")
+    await show_chat_settings(callback, peer_id)
+
+
+@dp.callback_query(F.data.startswith("ct_reply:"))
+async def cb_ct_reply(callback: CallbackQuery):
+    """Toggle trigger_reply"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE chat_triggers SET trigger_reply = NOT trigger_reply, updated_at = now()
+            WHERE peer_id = $1
+        """, peer_id)
+    await callback.answer("✅ Обновлено")
+    await show_chat_settings(callback, peer_id)
+
+
+@dp.callback_query(F.data.startswith("ct_keywords:"))
+async def cb_ct_keywords(callback: CallbackQuery):
+    """Toggle trigger_keywords"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE chat_triggers SET trigger_keywords = NOT trigger_keywords, updated_at = now()
+            WHERE peer_id = $1
+        """, peer_id)
+    await callback.answer("✅ Обновлено")
+    await show_chat_settings(callback, peer_id)
+
+
+@dp.callback_query(F.data.startswith("ct_random:"))
+async def cb_ct_random(callback: CallbackQuery):
+    """Toggle trigger_random"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE chat_triggers SET trigger_random = NOT trigger_random, updated_at = now()
+            WHERE peer_id = $1
+        """, peer_id)
+    await callback.answer("✅ Обновлено")
+    await show_chat_settings(callback, peer_id)
+
+
+@dp.callback_query(F.data.startswith("ct_set_keywords:"))
+async def cb_ct_set_keywords(callback: CallbackQuery, state: FSMContext):
+    """Ввод ключевых слов"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    await state.set_state(ChatSettingsState.waiting_keywords)
+    await state.update_data(peer_id=peer_id)
+    await callback.message.edit_text(
+        "🔑 Введите ключевые слова через запятую:\n\n"
+        "Пример: привет, помощь, как дела",
+        reply_markup=cancel_button(f"chat:{peer_id}")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ct_set_interval:"))
+async def cb_ct_set_interval(callback: CallbackQuery, state: FSMContext):
+    """Ввод интервала рандома"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    await state.set_state(ChatSettingsState.waiting_interval)
+    await state.update_data(peer_id=peer_id)
+    await callback.message.edit_text(
+        "⏱ Введите интервал рандома (мин макс):\n\n"
+        "Пример: 60 180\n"
+        "(будет отправлять раз в 60-180 минут)",
+        reply_markup=cancel_button(f"chat:{peer_id}")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ct_set_cooldown:"))
+async def cb_ct_set_cooldown(callback: CallbackQuery, state: FSMContext):
+    """Ввод кулдауна"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    await state.set_state(ChatSettingsState.waiting_cooldown)
+    await state.update_data(peer_id=peer_id)
+    await callback.message.edit_text(
+        "⏳ Введите кулдаун в секундах:\n\n"
+        "Пример: 300\n"
+        "(минимум 300 секунд между ответами)",
+        reply_markup=cancel_button(f"chat:{peer_id}")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("ct_set_limit:"))
+async def cb_ct_set_limit(callback: CallbackQuery, state: FSMContext):
+    """Ввод дневного лимита"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    await state.set_state(ChatSettingsState.waiting_limit)
+    await state.update_data(peer_id=peer_id)
+    await callback.message.edit_text(
+        "📊 Введите дневной лимит ответов:\n\n"
+        "Пример: 20",
+        reply_markup=cancel_button(f"chat:{peer_id}")
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("delete_chat:"))
+async def cb_delete_chat(callback: CallbackQuery):
+    """Запрос подтверждения удаления чата"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        peer = await conn.fetchrow("SELECT first_name, username FROM peers WHERE id = $1", peer_id)
+
+    if not peer:
+        await callback.answer("Чат не найден", show_alert=True)
+        return
+
+    name = peer["first_name"] or peer["username"] or str(peer_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete_chat:{peer_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"chat:{peer_id}")
+        ]
+    ])
+    await callback.message.edit_text(
+        f"🗑 Удалить чат {name}?\n\nБудут удалены все триггеры.",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_delete_chat:"))
+async def cb_confirm_delete_chat(callback: CallbackQuery):
+    """Подтверждение удаления чата"""
+    if not is_admin(callback.from_user.id):
+        return
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE peers SET is_deleted = true WHERE id = $1", peer_id)
+    await callback.answer("✅ Удалён", show_alert=True)
+    await show_chats(callback, 0)
+
+
+# ==================== CHAT FSM HANDLERS ====================
+
+@dp.message(ChatSettingsState.waiting_keywords)
+async def process_chat_keywords(message: Message, state: FSMContext):
+    """Обработка ключевых слов"""
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    peer_id = data.get('peer_id')
+    if not peer_id:
+        await state.clear()
+        return
+
+    keywords = message.text.strip()
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE chat_triggers SET keywords = $2, updated_at = now()
+            WHERE peer_id = $1
+        """, peer_id, keywords)
+
+    await state.clear()
+    await message.answer(f"✅ Ключевые слова сохранены:\n{keywords}", reply_markup=back_button())
+
+
+@dp.message(ChatSettingsState.waiting_interval)
+async def process_chat_interval(message: Message, state: FSMContext):
+    """Обработка интервала"""
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    peer_id = data.get('peer_id')
+    if not peer_id:
+        await state.clear()
+        return
+
+    try:
+        parts = message.text.strip().split()
+        min_val = int(parts[0])
+        max_val = int(parts[1]) if len(parts) > 1 else min_val * 2
+
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE chat_triggers SET random_interval_min = $2, random_interval_max = $3, updated_at = now()
+                WHERE peer_id = $1
+            """, peer_id, min_val, max_val)
+
+        await state.clear()
+        await message.answer(f"✅ Интервал: {min_val}-{max_val} мин", reply_markup=back_button())
+    except:
+        await message.answer("❌ Введите два числа: мин макс")
+
+
+@dp.message(ChatSettingsState.waiting_cooldown)
+async def process_chat_cooldown(message: Message, state: FSMContext):
+    """Обработка кулдауна"""
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    peer_id = data.get('peer_id')
+    if not peer_id:
+        await state.clear()
+        return
+
+    try:
+        cooldown = int(message.text.strip())
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE chat_triggers SET cooldown_sec = $2, updated_at = now()
+                WHERE peer_id = $1
+            """, peer_id, cooldown)
+
+        await state.clear()
+        await message.answer(f"✅ Кулдаун: {cooldown} сек", reply_markup=back_button())
+    except:
+        await message.answer("❌ Введите число")
+
+
+@dp.message(ChatSettingsState.waiting_limit)
+async def process_chat_limit(message: Message, state: FSMContext):
+    """Обработка лимита"""
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    peer_id = data.get('peer_id')
+    if not peer_id:
+        await state.clear()
+        return
+
+    try:
+        limit = int(message.text.strip())
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE chat_triggers SET daily_limit = $2, updated_at = now()
+                WHERE peer_id = $1
+            """, peer_id, limit)
+
+        await state.clear()
+        await message.answer(f"✅ Лимит: {limit}/день", reply_markup=back_button())
+    except:
+        await message.answer("❌ Введите число")
+
+
+# ==================== OTHER CALLBACKS ====================
+
+@dp.callback_query(F.data.startswith("sync_history:"))
+async def cb_sync_history(callback: CallbackQuery):
+    """Загрузка истории - перезапуск collector"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    parts = callback.data.split(":")
+    peer_id = int(parts[1])
+    
+    await callback.message.edit_text("⏳ Перезапускаю collector для синхронизации...")
+    
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["/usr/bin/sudo", "/usr/bin/systemctl", "restart", "collector"],
+            capture_output=True, text=True, timeout=10
+        )
+        
+        if result.returncode == 0:
+            await callback.message.edit_text(
+                "✅ Collector перезапущен\n\n"
+                "История загрузится в течение минуты",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"peer:{peer_id}")]
+                ])
+            )
+        else:
+            await callback.message.edit_text(
+                f"❌ Ошибка: {result.stderr}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"peer:{peer_id}")]
+                ])
+            )
+    except Exception as e:
+        logger.error(f"Error restarting collector: {e}")
+        await callback.message.edit_text(
+            f"❌ Ошибка: {e}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"peer:{peer_id}")]
+            ])
+        )
+
+
+@dp.callback_query(F.data.startswith("delete:"))
+async def cb_delete(callback: CallbackQuery):
+    """Запрос подтверждения удаления контакта"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        peer = await conn.fetchrow("SELECT first_name, username FROM peers WHERE id = $1", peer_id)
+    
+    if not peer:
+        await callback.answer("Контакт не найден", show_alert=True)
+        return
+    
+    name = peer["first_name"] or peer["username"] or str(peer_id)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"confirm_delete:{peer_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data=f"peer:{peer_id}")
+        ]
+    ])
+    await callback.message.edit_text(
+        f"🗑 Удалить {name} из базы?\n\nБудут удалены все сообщения и настройки.",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("confirm_delete:"))
+async def cb_confirm_delete(callback: CallbackQuery):
+    """Подтверждение удаления контакта"""
+    if not is_admin(callback.from_user.id):
+        return
+    
+    peer_id = int(callback.data.split(":")[1])
+    async with db_pool.acquire() as conn:
+        await conn.execute("UPDATE peers SET is_deleted = true WHERE id = $1", peer_id)
+    
+    await callback.answer("✅ Удалён", show_alert=True)
+    await show_peers(callback, 0)
+
+
+@dp.message(Command("addchat"))
+async def cmd_addchat(message: Message):
+    """Добавить чат по ID: /addchat -1001234567890 Название чата"""
+    if not is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        await message.answer(
+            "📝 Использование:\n"
+            "/addchat <chat_id> [название]\n\n"
+            "Пример:\n"
+            "/addchat -1001234567890 Мой чат\n\n"
+            "💡 Как узнать ID чата:\n"
+            "1. Добавь @getmyid_bot в чат\n"
+            "2. Он покажет ID чата"
+        )
+        return
+
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ ID чата должен быть числом (например -1001234567890)")
+        return
+
+    chat_title = parts[2] if len(parts) > 2 else f"Chat {chat_id}"
+
+    peer_id, is_new = await get_or_create_peer(
+        chat_id,
+        None,
+        chat_title,
+        peer_type='chat'
+    )
+
+    if is_new:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO chat_triggers (peer_id, account_id) VALUES ($1, 1)
+                ON CONFLICT (account_id, peer_id) DO NOTHING
+            """, peer_id)
+
+        await message.answer(
+            f"✅ Чат '{chat_title}' добавлен (ID: {chat_id})",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"chat:{peer_id}")]
+            ])
+        )
+    else:
+        await message.answer(
+            f"ℹ️ Чат '{chat_title}' уже в базе",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚙️ Открыть", callback_data=f"chat:{peer_id}")]
+            ])
+        )
+
+
+@dp.message(F.forward_origin)
+async def handle_forward_origin(message: Message):
+    """Обработка пересланных сообщений (aiogram 3.x forward_origin)"""
+    if not is_admin(message.from_user.id):
+        return
+
+    origin = message.forward_origin
+    if not origin:
+        return
+
+    # Логируем всю структуру для отладки
+    origin_type = getattr(origin, 'type', None) or type(origin).__name__
+    logger.info(f"Forward origin type: {origin_type}, attrs: {dir(origin)}")
+
+    # Для каналов и супергрупп (MessageOriginChannel)
+    if hasattr(origin, 'chat') and origin.chat:
+        chat = origin.chat
+        chat_id = chat.id
+        chat_title = chat.title or f"Chat {chat_id}"
+        chat_username = getattr(chat, 'username', None)
+
+        logger.info(f"Forward from chat: {chat_title} (ID: {chat_id})")
+
+        # Добавляем чат
+        peer_id, is_new = await get_or_create_peer(
+            chat_id,
+            chat_username,
+            chat_title,
+            peer_type='chat'
+        )
+
+        if is_new:
+            # Создаём дефолтные триггеры
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO chat_triggers (peer_id, account_id) VALUES ($1, 1)
+                    ON CONFLICT (account_id, peer_id) DO NOTHING
+                """, peer_id)
+
+            await message.answer(
+                f"✅ Чат '{chat_title}' добавлен",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"chat:{peer_id}")]
+                ])
+            )
+        else:
+            await message.answer(
+                f"ℹ️ Чат '{chat_title}' уже в базе",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Открыть", callback_data=f"chat:{peer_id}")]
+                ])
+            )
+        return
+
+    # Для пользователей (forward_origin.user)
+    if hasattr(origin, 'sender_user'):
+        fwd = origin.sender_user
+        if not fwd:
+            await message.answer("❌ Не удалось определить отправителя")
+            return
+
+        # Игнорируем себя
+        if fwd.id == ADMIN_USER_ID:
+            await message.answer("🤔 Это же ты сам!")
+            return
+
+        # Игнорируем ботов
+        if fwd.is_bot:
+            await message.answer("🤖 Ботов добавлять не нужно")
+            return
+
+        peer_id, is_new = await get_or_create_peer(fwd.id, fwd.username, fwd.first_name)
+        name = fwd.first_name or fwd.username or str(fwd.id)
+
+        if is_new:
+            await message.answer(
+                f"✅ {name} добавлен в базу",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Настроить", callback_data=f"peer:{peer_id}")]
+                ])
+            )
+        else:
+            await message.answer(
+                f"ℹ️ {name} уже в базе",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Открыть", callback_data=f"peer:{peer_id}")]
+                ])
+            )
+        return
+
+    # Скрытый пользователь
+    if hasattr(origin, 'sender_user_name'):
+        await message.answer(f"❌ Пользователь скрыл свой профиль: {origin.sender_user_name}")
+        return
+
+    await message.answer("❌ Не удалось определить источник пересылки")
 
 
 @dp.message()

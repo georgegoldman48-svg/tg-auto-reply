@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -27,7 +28,7 @@ import aiohttp
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetDialogFiltersRequest
-from telethon.tl.types import User
+from telethon.tl.types import User, Chat, Channel
 
 # Загрузка .env
 load_dotenv()
@@ -817,12 +818,353 @@ async def check_ai_server() -> bool:
     return False
 
 
+# ============================================
+# CHAT TRIGGERS SUPPORT
+# ============================================
+
+async def get_chat_triggers(chat_tg_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Получить триггеры для чата из БД.
+
+    Args:
+        chat_tg_id: Telegram ID чата (группы/канала)
+
+    Returns:
+        Dict с настройками триггеров или None если чат не настроен
+    """
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT
+                ct.id,
+                ct.peer_id,
+                ct.enabled,
+                ct.trigger_mention,
+                ct.trigger_reply,
+                ct.trigger_keywords,
+                ct.trigger_random,
+                ct.keywords,
+                ct.random_interval_min,
+                ct.random_interval_max,
+                ct.last_random_time,
+                ct.cooldown_sec,
+                ct.daily_limit,
+                ct.daily_count,
+                ct.last_count_reset,
+                p.tg_peer_id,
+                p.first_name,
+                p.username
+            FROM chat_triggers ct
+            JOIN peers p ON p.id = ct.peer_id
+            WHERE p.tg_peer_id = $1 AND ct.enabled = true AND ct.account_id = $2
+        """, chat_tg_id, ACCOUNT_ID)
+
+        if row:
+            return dict(row)
+        return None
+
+
+async def check_chat_triggers(
+    chat_tg_id: int,
+    message_text: str,
+    is_mention: bool,
+    is_reply_to_me: bool,
+    my_username: str
+) -> Optional[str]:
+    """
+    Проверить, нужно ли отвечать на сообщение в чате.
+
+    Args:
+        chat_tg_id: Telegram ID чата
+        message_text: Текст сообщения
+        is_mention: Упомянули ли нас (@username)
+        is_reply_to_me: Это ответ на наше сообщение
+        my_username: Наш username
+
+    Returns:
+        str: Причина срабатывания ('mention', 'reply', 'keyword') или None
+    """
+    triggers = await get_chat_triggers(chat_tg_id)
+
+    if not triggers:
+        return None
+
+    # Проверяем лимиты
+    if not await check_chat_limits(triggers['peer_id']):
+        logger.debug(f"Chat {chat_tg_id}: daily limit reached")
+        return None
+
+    # Проверяем cooldown
+    if triggers.get('cooldown_sec') and triggers.get('last_random_time'):
+        now = datetime.now(timezone.utc)
+        last_time = triggers['last_random_time']
+        if last_time.tzinfo is None:
+            last_time = last_time.replace(tzinfo=timezone.utc)
+        elapsed = (now - last_time).total_seconds()
+        if elapsed < triggers['cooldown_sec']:
+            logger.debug(f"Chat {chat_tg_id}: cooldown active ({elapsed:.0f}/{triggers['cooldown_sec']}s)")
+            return None
+
+    # Проверяем триггеры по приоритету
+
+    # 1. Упоминание (@username)
+    if triggers['trigger_mention'] and is_mention:
+        logger.info(f"Chat {chat_tg_id}: triggered by mention")
+        return 'mention'
+
+    # 2. Ответ на наше сообщение
+    if triggers['trigger_reply'] and is_reply_to_me:
+        logger.info(f"Chat {chat_tg_id}: triggered by reply")
+        return 'reply'
+
+    # 3. Ключевые слова
+    if triggers['trigger_keywords'] and triggers.get('keywords'):
+        keywords = [kw.strip().lower() for kw in triggers['keywords'].split(',') if kw.strip()]
+        message_lower = message_text.lower()
+        for keyword in keywords:
+            if keyword in message_lower:
+                logger.info(f"Chat {chat_tg_id}: triggered by keyword '{keyword}'")
+                return 'keyword'
+
+    return None
+
+
+async def check_chat_limits(peer_id: int) -> bool:
+    """
+    Проверить лимиты для чата.
+
+    Args:
+        peer_id: Внутренний ID чата из peers
+
+    Returns:
+        bool: True если можно отвечать, False если лимит исчерпан
+    """
+    async with db_pool.acquire() as conn:
+        today = datetime.now(timezone.utc).date()
+
+        row = await conn.fetchrow("""
+            SELECT daily_count, daily_limit, last_count_reset
+            FROM chat_triggers
+            WHERE peer_id = $1 AND account_id = $2
+        """, peer_id, ACCOUNT_ID)
+
+        if not row:
+            return False
+
+        # Сброс счётчика если новый день
+        if row['last_count_reset'] != today:
+            await conn.execute("""
+                UPDATE chat_triggers
+                SET daily_count = 0, last_count_reset = $1
+                WHERE peer_id = $2 AND account_id = $3
+            """, today, peer_id, ACCOUNT_ID)
+            return True
+
+        # Проверяем лимит
+        if row['daily_count'] >= row['daily_limit']:
+            return False
+
+        return True
+
+
+async def update_chat_counters(peer_id: int) -> None:
+    """
+    Обновить счётчики после отправки ответа в чат.
+
+    Args:
+        peer_id: Внутренний ID чата из peers
+    """
+    async with db_pool.acquire() as conn:
+        today = datetime.now(timezone.utc).date()
+
+        await conn.execute("""
+            UPDATE chat_triggers
+            SET
+                daily_count = CASE
+                    WHEN last_count_reset != $1 THEN 1
+                    ELSE daily_count + 1
+                END,
+                last_count_reset = $1,
+                last_random_time = now(),
+                updated_at = now()
+            WHERE peer_id = $2 AND account_id = $3
+        """, today, peer_id, ACCOUNT_ID)
+
+
+async def get_or_create_chat_peer(conn, chat_tg_id: int, title: str = None) -> int:
+    """
+    Получить или создать запись peer для чата.
+
+    Args:
+        conn: Соединение с БД
+        chat_tg_id: Telegram ID чата
+        title: Название чата
+
+    Returns:
+        int: Внутренний peer_id
+    """
+    row = await conn.fetchrow("""
+        INSERT INTO peers (tg_peer_id, first_name, peer_type, is_bot)
+        VALUES ($1, $2, 'chat', false)
+        ON CONFLICT (tg_peer_id) DO UPDATE SET
+            first_name = COALESCE(EXCLUDED.first_name, peers.first_name),
+            updated_at = now()
+        RETURNING id
+    """, chat_tg_id, title)
+
+    return row['id']
+
+
+async def process_chat_message(
+    chat_tg_id: int,
+    chat_title: str,
+    message_text: str,
+    tg_msg_id: int,
+    trigger_reason: str,
+    peer_id: int
+) -> bool:
+    """
+    Обработать сообщение в чате и отправить ответ.
+
+    Args:
+        chat_tg_id: Telegram ID чата
+        chat_title: Название чата
+        message_text: Текст сообщения
+        tg_msg_id: ID сообщения для reply
+        trigger_reason: Причина срабатывания (mention/reply/keyword)
+        peer_id: Внутренний ID чата из peers
+
+    Returns:
+        bool: True если ответ отправлен
+    """
+    async with db_pool.acquire() as conn:
+        # Проверяем глобальный флаг
+        if not await is_auto_reply_enabled(conn):
+            return False
+
+        # Проверяем AI
+        ai_enabled = await is_ai_enabled(conn)
+        ai_settings = await get_ai_settings(conn)
+
+        # Формируем контекст для AI
+        context_prompt = f"Сообщение в групповом чате '{chat_title}'. "
+        if trigger_reason == 'mention':
+            context_prompt += "Тебя упомянули по имени. "
+        elif trigger_reason == 'reply':
+            context_prompt += "Это ответ на твоё сообщение. "
+        elif trigger_reason == 'keyword':
+            context_prompt += "В сообщении есть ключевое слово. "
+        context_prompt += "Отвечай кратко и по делу."
+
+        # Генерируем ответ
+        if ai_enabled:
+            reply_text = await generate_ai_response(
+                message_text,
+                peer_id,
+                [],  # Нет истории для чатов
+                ai_settings,
+                context_prompt
+            )
+            if not reply_text:
+                reply_text = FALLBACK_MESSAGE
+        else:
+            reply_text = FALLBACK_MESSAGE
+
+        # Отправляем ответ
+        if await send_reply(chat_tg_id, reply_text, reply_to_msg_id=tg_msg_id):
+            await update_chat_counters(peer_id)
+            logger.info(f"✓ Chat reply sent to '{chat_title}' (trigger: {trigger_reason})")
+            return True
+        else:
+            logger.error(f"✗ Failed to send chat reply to '{chat_title}'")
+            return False
+
+
+async def random_chat_task(tg_client):
+    """Фоновая задача для рандомных сообщений в чатах.
+    Проверяет раз в минуту, нужно ли отправить рандомное сообщение.
+
+    Условия отправки:
+    - trigger_random включён для чата
+    - Прошёл интервал random_interval_min..random_interval_max минут
+    - Не превышен daily_limit
+    - Последнее сообщение в чате НЕ от меня
+    """
+    logger.info("Random chat task started")
+    me = await tg_client.get_me()
+    my_id = me.id
+
+    while True:
+        try:
+            await asyncio.sleep(60)
+
+            async with db_pool.acquire() as conn:
+                chats = await conn.fetch("""
+                    SELECT ct.*, p.tg_peer_id, p.first_name as chat_name
+                    FROM chat_triggers ct
+                    JOIN peers p ON p.id = ct.peer_id
+                    WHERE ct.enabled = true
+                      AND ct.trigger_random = true
+                      AND ct.daily_count < ct.daily_limit
+                      AND (
+                          ct.last_random_time IS NULL
+                          OR EXTRACT(EPOCH FROM (now() - ct.last_random_time)) / 60 >= ct.random_interval_min
+                      )
+                """)
+
+                for chat in chats:
+                    try:
+                        # Проверка рандомного интервала
+                        if chat['last_random_time']:
+                            minutes_passed = (datetime.now(timezone.utc) - chat['last_random_time']).total_seconds() / 60
+                            random_interval = chat['random_interval_min'] + random.random() * (chat['random_interval_max'] - chat['random_interval_min'])
+                            if minutes_passed < random_interval:
+                                continue
+
+                        # ВАЖНО: Если последнее сообщение от меня — пропускаем
+                        last_messages = await tg_client.get_messages(chat['tg_peer_id'], limit=1)
+                        if last_messages and last_messages[0].sender_id == my_id:
+                            logger.debug(f"Skip {chat['chat_name']}: last message is mine")
+                            continue
+
+                        # Загружаем контекст (30 сообщений)
+                        context_messages = await tg_client.get_messages(chat['tg_peer_id'], limit=30)
+                        context = "\n".join([
+                            f"{getattr(m.sender, 'first_name', 'User')}: {m.text}"
+                            for m in reversed(context_messages) if m and m.text
+                        ])
+
+                        # Генерируем сообщение через AI
+                        ai_settings = await get_ai_settings(conn)
+                        random_prompt = f"Контекст чата:\n{context}\n\nНапиши короткое уместное сообщение в этот чат. Не задавай вопросов, просто участвуй в разговоре."
+                        response = await generate_ai_response(
+                            random_prompt,
+                            chat['peer_id'],
+                            [],
+                            ai_settings,
+                            None
+                        )
+
+                        if response:
+                            await tg_client.send_message(chat['tg_peer_id'], response)
+                            await update_chat_counters(chat['peer_id'])
+                            logger.info(f"🎲 Random message sent to chat {chat['chat_name']}")
+
+                        await asyncio.sleep(5)
+
+                    except Exception as e:
+                        logger.error(f"Random message error for chat {chat['tg_peer_id']}: {e}")
+
+        except Exception as e:
+            logger.error(f"Random chat task error: {e}")
+            await asyncio.sleep(60)
+
+
 async def main() -> None:
     """Главная функция worker"""
     global client
     
     logger.info("=" * 60)
-    logger.info("Auto-Reply Worker v2.11 (reply_mode per contact)")
+    logger.info("Auto-Reply Worker v2.13 (random chat messages)")
     logger.info("=" * 60)
     logger.info(f"Check interval: {CHECK_INTERVAL} seconds")
     logger.info(f"AI server: {AI_SERVER_URL}")
@@ -852,22 +1194,70 @@ async def main() -> None:
     # Информация о текущем аккаунте
     me = await client.get_me()
     my_id = me.id
-    logger.info(f"Logged in as: {me.first_name} (@{me.username or 'no username'}) [ID: {my_id}]")
+    my_username = me.username or ""
+    logger.info(f"Logged in as: {me.first_name} (@{my_username or 'no username'}) [ID: {my_id}]")
 
-    # Обработчик новых входящих сообщений (для новых контактов)
+    # Обработчик новых входящих сообщений (личные + чаты)
     @client.on(events.NewMessage(incoming=True))
     async def handle_new_message(event):
         """
-        Обработка входящих сообщений от новых контактов.
-
-        Новый контакт = не в Personal И нет активного правила.
-        Отвечаем до лимита new_contact_max_replies (5).
+        Обработка входящих сообщений:
+        1. Личные сообщения от новых контактов
+        2. Сообщения в чатах с настроенными триггерами
         """
         try:
-            # Только личные сообщения
+            message_text = event.message.text or ""
+            tg_msg_id = event.message.id
+
+            # === ОБРАБОТКА ГРУППОВЫХ ЧАТОВ ===
             if not event.is_private:
+                chat = await event.get_chat()
+                if not isinstance(chat, (Chat, Channel)):
+                    return
+
+                chat_tg_id = chat.id
+                chat_title = getattr(chat, 'title', '') or f"Chat:{chat_tg_id}"
+
+                # Проверяем: упомянули ли нас
+                is_mention = False
+                if my_username and f"@{my_username.lower()}" in message_text.lower():
+                    is_mention = True
+
+                # Проверяем: это ответ на наше сообщение
+                is_reply_to_me = False
+                if event.message.reply_to:
+                    try:
+                        reply_msg = await event.message.get_reply_message()
+                        if reply_msg and reply_msg.sender_id == my_id:
+                            is_reply_to_me = True
+                    except:
+                        pass
+
+                # Проверяем триггеры
+                trigger_reason = await check_chat_triggers(
+                    chat_tg_id,
+                    message_text,
+                    is_mention,
+                    is_reply_to_me,
+                    my_username
+                )
+
+                if trigger_reason:
+                    # Получаем peer_id для чата
+                    triggers = await get_chat_triggers(chat_tg_id)
+                    if triggers:
+                        peer_id = triggers['peer_id']
+                        await process_chat_message(
+                            chat_tg_id,
+                            chat_title,
+                            message_text,
+                            tg_msg_id,
+                            trigger_reason,
+                            peer_id
+                        )
                 return
 
+            # === ОБРАБОТКА ЛИЧНЫХ СООБЩЕНИЙ ===
             sender = await event.get_sender()
             if not sender or not isinstance(sender, User):
                 return
@@ -898,9 +1288,6 @@ async def main() -> None:
                 else:
                     # Совсем новый (нет в peers)
                     logger.info(f"🆕 New contact: {sender.first_name} (@{sender.username}) [ID: {tg_peer_id}]")
-
-                message_text = event.message.text or ""
-                tg_msg_id = event.message.id
 
                 # Обрабатываем нового контакта (создаст peer если нет, и ответит)
                 result = await process_new_contact(tg_peer_id, message_text, tg_msg_id)
@@ -949,6 +1336,9 @@ async def main() -> None:
     # Запускаем polling loop как фоновую задачу
     polling_task = asyncio.create_task(polling_loop())
 
+    # Запускаем random chat task для рандомных сообщений в чатах
+    random_task = asyncio.create_task(random_chat_task(client))
+
     try:
         # run_until_disconnected для обработки событий Telethon
         await client.run_until_disconnected()
@@ -956,8 +1346,13 @@ async def main() -> None:
         logger.info("Received shutdown signal...")
     finally:
         polling_task.cancel()
+        random_task.cancel()
         try:
             await polling_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await random_task
         except asyncio.CancelledError:
             pass
         await client.disconnect()
