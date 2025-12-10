@@ -1,4 +1,4 @@
-# Telegram Auto-Reply Service v2.1
+# Telegram Auto-Reply Service v2.2
 
 > Интеллектуальный автоответчик для Telegram с AI интеграцией
 
@@ -40,8 +40,8 @@
 
 | Компонент | Версия | Файл | Описание |
 |-----------|--------|------|----------|
-| **Worker** | v2.11 | `worker/auto_reply.py` | Основной обработчик автоответов с AI |
-| **Admin Bot** | v3.3 | `bots/admin_bot.py` | Telegram бот для управления |
+| **Worker** | v2.12 | `worker/auto_reply.py` | Основной обработчик автоответов с AI |
+| **Admin Bot** | v3.5 | `bots/admin_bot.py` | Telegram бот для управления |
 | **Collector** | v1.0 | `collector/collector.py` | Сбор истории сообщений |
 | **Core API** | v1.0 | `core/main.py` | REST API (FastAPI) |
 
@@ -367,6 +367,16 @@ GET  /stats                    - Статистика
 ```
 
 ## Changelog
+
+### v2.2 (2024-12-10)
+- **Chat Triggers**: Поддержка автоответов в групповых чатах
+  - Триггеры: @mention, reply, keywords, random
+  - Cooldown и дневные лимиты для чатов
+  - Управление через Admin Bot
+- **Bug fixes**:
+  - Фильтрация системных сообщений Telegram (ID 777000)
+  - Фильтрация сообщений от владельца аккаунта (Saved Messages)
+- **Admin Bot v3.5**: Раздел "Чаты" для управления триггерами
 
 ### v2.1 (2024-12-05)
 - **Local AI**: Поддержка обученной модели Qwen + LoRA через SSH туннель

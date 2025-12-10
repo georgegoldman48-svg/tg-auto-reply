@@ -58,6 +58,7 @@ if not all([API_ID, API_HASH, PHONE, DATABASE_URL]):
 # Глобальные переменные
 db_pool: Optional[asyncpg.Pool] = None
 client: Optional[TelegramClient] = None
+my_user_id: Optional[int] = None  # ID владельца аккаунта
 
 
 async def init_db() -> asyncpg.Pool:
@@ -85,14 +86,23 @@ async def close_db() -> None:
 async def ensure_peer(conn: asyncpg.Connection, entity: User) -> int:
     """
     Создать или обновить запись о собеседнике в таблице peers.
+    Пропускает удалённых пользователей (is_deleted = true).
     
     Args:
         conn: Соединение с БД
         entity: Telegram User entity
         
     Returns:
-        int: Внутренний peer_id (peers.id)
+        int: Внутренний peer_id (peers.id) или None если удалён
     """
+    # Проверяем, не удалён ли peer
+    deleted = await conn.fetchval(
+        "SELECT is_deleted FROM peers WHERE tg_peer_id = $1",
+        entity.id
+    )
+    if deleted:
+        return None
+    
     row = await conn.fetchrow("""
         INSERT INTO peers (tg_peer_id, tg_access_hash, peer_type, username, first_name, last_name, is_bot)
         VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -178,14 +188,22 @@ async def sync_history() -> None:
         async for dialog in client.iter_dialogs():
             entity = dialog.entity
             
-            # Фильтр: только личные диалоги с пользователями (не боты, не группы, не каналы)
+            # Фильтр: только личные диалоги с пользователями (не боты, не группы, не каналы, не сам себе)
             if not isinstance(entity, User):
                 continue
             if getattr(entity, 'bot', False):
                 continue
+            if entity.id == my_user_id:
+                continue  # Пропускаем Saved Messages (диалог с самим собой)
+            if entity.id == 777000:
+                continue  # Пропускаем системные сообщения Telegram
             
             total_dialogs += 1
             peer_id = await ensure_peer(conn, entity)
+            
+            # Пропускаем удалённых
+            if peer_id is None:
+                continue
             
             # Имя для логов
             display_name = entity.first_name or entity.username or f"ID:{entity.id}"
@@ -231,7 +249,9 @@ async def handle_new_message(event) -> None:
             return
         if getattr(sender, 'bot', False):
             return
-        
+        if sender.id == 777000:
+            return  # Пропускаем системные сообщения Telegram
+
         async with db_pool.acquire() as conn:
             peer_id = await ensure_peer(conn, sender)
             is_new = await save_message(conn, peer_id, msg)
@@ -265,7 +285,9 @@ async def handle_outgoing_message(event) -> None:
             return
         if getattr(chat, 'bot', False):
             return
-        
+        if chat.id == 777000:
+            return  # Пропускаем системные сообщения Telegram
+
         async with db_pool.acquire() as conn:
             peer_id = await ensure_peer(conn, chat)
             is_new = await save_message(conn, peer_id, msg)
@@ -281,7 +303,7 @@ async def handle_outgoing_message(event) -> None:
 
 async def main() -> None:
     """Главная функция collector"""
-    global client
+    global client, my_user_id
     
     logger.info("=" * 60)
     logger.info("Telegram Collector v1.0")
@@ -313,10 +335,11 @@ async def main() -> None:
     
     # Информация о текущем аккаунте
     me = await client.get_me()
+    my_user_id = me.id  # Сохраняем свой ID для фильтрации
     logger.info(f"Logged in as: {me.first_name} (@{me.username or 'no username'}) [ID: {me.id}]")
     
     # Синхронизация истории (раскомментируй при первом запуске)
-    # await sync_history()
+    await sync_history()
     
     logger.info("=" * 60)
     logger.info("Collector started. Listening for new messages...")
